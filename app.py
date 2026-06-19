@@ -639,6 +639,26 @@ def _parse_aws_access_portal_blocks(text: str) -> list[AccountInput]:
     return accounts
 
 
+def extract_start_url_from_accounts_text(text: str) -> str:
+    """从 AWS access portal 文本块中提取 IDC Start URL。
+
+    优先使用 IPv4-only 的 https://d-*.awsapps.com/start；没有时再用 dual-stack URL。
+    """
+    default_url = ""
+    dual_stack_url = ""
+    for raw in (text or "").splitlines():
+        match = AWS_BLOCK_FIELD_RE.match(raw.strip())
+        if not match:
+            continue
+        key = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        value = match.group(2).strip()
+        if key.startswith("default aws access portal url") and value.startswith(("http://", "https://")):
+            default_url = value
+        elif key.startswith("dual-stack aws access portal url") and value.startswith(("http://", "https://")):
+            dual_stack_url = value
+    return default_url or dual_stack_url
+
+
 def parse_accounts(text: str) -> list[AccountInput]:
     """解析账号输入。支持格式（分隔符可用空格/tab/逗号/分号/竖线/冒号）：
       email password                       # 最简
@@ -1338,7 +1358,8 @@ def create_job():
         return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
     if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
         return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
-    raw_start_url = (payload.get("startUrl") or "").strip()
+    raw_accounts_text = payload.get("accounts", "")
+    raw_start_url = (payload.get("startUrl") or "").strip() or extract_start_url_from_accounts_text(raw_accounts_text)
     ok_start_url, start_url_or_error = validate_start_url(raw_start_url)
     if not ok_start_url:
         return jsonify({"error": start_url_or_error}), 400
