@@ -25,7 +25,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, jsonify, make_response, redirect, render_template, request, send_file, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import device_code_auth as dca
@@ -44,6 +44,14 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=True,
 )
+
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 JOBS: dict[str, "Job"] = {}
 JOBS_LOCK = threading.RLock()
@@ -302,6 +310,7 @@ def account_result_to_dict(result: "AccountResult") -> dict[str, Any]:
         "changedPassword": result.changed_password,
         "exportedCount": len(result.exported),
         "apiKeyCount": len(result.api_keys),
+        "mfaSecret": result.mfa_secret,
     }
 
 
@@ -326,6 +335,7 @@ def save_job_history() -> None:
                     "results": [account_result_to_dict(result) for result in job.results],
                     "export_path": job.export_path,
                     "api_keys_path": job.api_keys_path,
+                    "mfa_secrets_path": job.mfa_secrets_path,
                     "log_path": job.log_path,
                     "total": job.total,
                     "threads": job.threads,
@@ -365,6 +375,7 @@ def restore_job_history() -> None:
                     logs=list(item.get("logs") or []),
                     export_path=item.get("export_path") or "",
                     api_keys_path=item.get("api_keys_path") or "",
+                    mfa_secrets_path=item.get("mfa_secrets_path") or "",
                     log_path=item.get("log_path") or "",
                     total=int(item.get("total") or 0),
                     threads=int(item.get("threads") or 1),
@@ -380,6 +391,7 @@ def restore_job_history() -> None:
                         bool(result.get("ok")),
                         result.get("message") or "",
                         bool(result.get("changedPassword")),
+                        mfa_secret=result.get("mfaSecret") or "",
                     ))
                 JOBS[job.id] = job
     except Exception as exc:
@@ -515,6 +527,7 @@ class AccountInput:
     email: str
     password: str
     proxy: str = ""
+    mfa_secret: str = ""   # 已绑定 MFA 的账号需要提供 TOTP 密钥（base32）
 
 
 @dataclass
@@ -526,6 +539,7 @@ class AccountResult:
     changed_password: bool = False
     exported: list[dict[str, Any]] = field(default_factory=list)
     api_keys: list[str] = field(default_factory=list)
+    mfa_secret: str = ""   # 本次登录绑定的新 MFA 密钥（如有）
 
 
 @dataclass
@@ -540,6 +554,7 @@ class Job:
     results: list[AccountResult] = field(default_factory=list)
     export_path: str = ""
     api_keys_path: str = ""
+    mfa_secrets_path: str = ""
     log_path: str = ""
     total: int = 0
     threads: int = 1
@@ -547,6 +562,11 @@ class Job:
     ok: int = 0
     failed: int = 0
     error: str = ""
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    stop_requested: bool = False
+    # 仅内存保留（不入持久化/不传前端），用于「重试失败项」重建账号
+    accounts: list["AccountInput"] = field(default_factory=list, repr=False)
+    options: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def log(self, message: str) -> None:
         simplified = simplify_job_message(message)
@@ -568,7 +588,26 @@ class Job:
         save_job_history()
 
 
+def _looks_like_mfa_secret(value: str) -> bool:
+    """判断某段是否像 authenticator 导出的 base32 TOTP 密钥。
+    特征：去掉空格/连字符后只含 A-Z 2-7（base32 字母表），长度 16-64。
+    用于自动识别第 3/4 段到底是代理还是 MFA 密钥，无需 mfa= 前缀。
+    """
+    v = re.sub(r"[\s-]", "", (value or "")).upper()
+    if not (16 <= len(v) <= 64):
+        return False
+    return bool(re.fullmatch(r"[A-Z2-7]+", v))
+
+
 def parse_accounts(text: str) -> list[AccountInput]:
+    """解析账号输入。支持格式（分隔符可用空格/tab/逗号/分号/竖线/冒号）：
+      email password                       # 最简
+      email password proxy                 # 带代理
+      email password mfa_secret            # 已绑定 MFA（自动识别 base32 密钥）
+      email password proxy mfa_secret      # 代理 + MFA
+    第 3 段会自动判断是代理还是 MFA 密钥：看起来像 base32 密钥就当 MFA，
+    否则当代理。无需 mfa= 前缀。mfa_secret 是 authenticator app 导出的 base32（A-Z 2-7）。
+    """
     accounts: list[AccountInput] = []
     for idx, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -578,14 +617,24 @@ def parse_accounts(text: str) -> list[AccountInput]:
         if ACCOUNT_SEP_RE.search(line):
             parts = ACCOUNT_SEP_RE.split(line)
         else:
-            parts = line.split(":", 1)
-        parts = [p.strip() for p in parts]
+            # 同时支持 email:password[:proxy[:mfa]]
+            parts = line.split(":", 3)
+        parts = [p.strip() for p in parts if p.strip() != ""]
         email = parts[0] if parts else ""
         password = parts[1] if len(parts) > 1 else ""
-        proxy = sanitize_proxy(parts[2] if len(parts) > 2 else "")
+        proxy = ""
+        mfa_secret = ""
+        # 第 3/4 段：自动识别代理 vs MFA 密钥（不要求顺序/占位符）
+        for seg in parts[2:4]:
+            if not seg:
+                continue
+            if not mfa_secret and _looks_like_mfa_secret(seg):
+                mfa_secret = seg
+            elif not proxy:
+                proxy = sanitize_proxy(seg)
         if not email or not password or email.lower() in {"email", "username", "user", "account"}:
             continue
-        accounts.append(AccountInput(idx=idx, email=email, password=password, proxy=proxy))
+        accounts.append(AccountInput(idx=idx, email=email, password=password, proxy=proxy, mfa_secret=mfa_secret))
     return accounts
 
 
@@ -892,6 +941,45 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     def log(message: str) -> None:
         job.log(f"{prefix}: {message}")
 
+    # 任务已被中断：未开始的账号直接跳过，不再发起登录/轮询
+    if job.stop_event.is_set():
+        return AccountResult(acc.idx, acc.email, False, "已中断（任务被手动停止，未执行）")
+
+    # MFA 密钥早期落盘：抠到密钥的瞬间立刻完整写盘（不脱敏、不等绑定结果）。
+    # 即使后续被取消/超时/AWS 卡住/进程崩溃，密钥也已安全保存到下面这个文件。
+    # 文件名带 -early- 区分；最终绑定成功的密钥仍走原 kiro-mfa-secrets-{job}.txt。
+    out_dir = Path(__file__).parent / "exports" / job.customer_id
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.chmod(0o700)
+    except Exception:
+        pass
+    early_mfa_path = out_dir / f"kiro-mfa-secrets-early-{job.id}.txt"
+    saved_early: dict[str, bool] = {"done": False}
+
+    def _save_mfa_early(secret: str) -> None:
+        try:
+            line = f"{acc.email}:{secret}\n"
+            with early_mfa_path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+            try:
+                early_mfa_path.chmod(0o600)
+            except Exception:
+                pass
+            # 立刻把下载入口指向早期文件：即使后续绑定失败/取消，前端也能下载到完整密钥。
+            # 若之后绑定成功，run_job 末尾会用最终文件覆盖此路径（两者都含完整密钥）。
+            with JOBS_LOCK:
+                if not job.mfa_secrets_path:
+                    job.mfa_secrets_path = str(early_mfa_path)
+            if not saved_early["done"]:
+                log(f"MFA 密钥已立刻完整落盘：{early_mfa_path.name}（{len(secret)} 位），可在任务完成后下载")
+                saved_early["done"] = True
+            save_job_history()
+            audit("mfa.early_saved", jobId=job.id, customerId=job.customer_id,
+                  email=acc.email, length=len(secret), path=str(early_mfa_path))
+        except Exception as exc:
+            log(f"MFA 密钥落盘失败：{exc}")
+
     log("开始登录")
     start = dca.register_and_start(
         oidc_region=options["oidc_region"],
@@ -916,14 +1004,19 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         timeout_s=options["login_timeout"],
         window_index=acc.idx - 1,
         window_count=options["threads"],
+        stop_event=job.stop_event,
+        mfa_secret=acc.mfa_secret,
+        on_secret=_save_mfa_early,
     )
     if not outcome.ok:
         log(f"浏览器登录失败：{outcome.error}")
         return AccountResult(acc.idx, acc.email, False, outcome.error, outcome.changed_password)
 
     log("浏览器授权完成，开始换取 token")
+    if outcome.mfa_secret:
+        log(f"已绑定新 MFA，密钥：{outcome.mfa_secret}（请妥善保存）")
 
-    exp = dca.poll_for_token(start, fetch_profile=False, log=log)
+    exp = dca.poll_for_token(start, fetch_profile=False, log=log, stop_event=job.stop_event)
     if exp.error:
         log(f"换取 token 失败：{exp.error}")
         return AccountResult(acc.idx, acc.email, False, exp.error, outcome.changed_password)
@@ -949,7 +1042,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             return AccountResult(acc.idx, acc.email, False, check_error, outcome.changed_password)
         exported.append(flatten_export(exp, acc.email, profile, 0))
     api_keys: list[str] = []
-    if options.get("create_api_keys"):
+    if options.get("create_api_keys") or options.get("api_key_only"):
         api_label = options.get("api_key_label") or "1"
         for profile in profiles:
             try:
@@ -965,9 +1058,11 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
                     exported,
                     api_keys,
                 )
-    suffix = f"，apiKeys={len(api_keys)}" if options.get("create_api_keys") else ""
+    suffix = f"，apiKeys={len(api_keys)}" if (options.get("create_api_keys") or options.get("api_key_only")) else ""
+    if outcome.mfa_secret:
+        suffix += "，已绑定 MFA"
     log(f"账号处理完成：profile {len(exported)} 个{suffix}")
-    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", outcome.changed_password, exported, api_keys)
+    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", outcome.changed_password, exported, api_keys, outcome.mfa_secret)
 
 
 def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> None:
@@ -1020,8 +1115,20 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
             api_keys_path.write_text("\n".join(api_keys_all) + "\n", encoding="utf-8")
             api_keys_path.chmod(0o600)
             job.api_keys_path = str(api_keys_path)
-        job.status = "finished" if job.failed == 0 else "failed"
-        job.log(f"完成：成功 {job.ok}，失败 {job.failed}，导出 {0 if options.get('api_key_only') else len(exported_all)} 条，API Key {len(api_keys_all)} 条")
+        # 绑定了新 MFA 的账号：导出 email:secret 供下载保存
+        mfa_lines = [f"{r.email}:{r.mfa_secret}" for r in job.results if r.mfa_secret]
+        if mfa_lines:
+            mfa_path = out_dir / f"kiro-mfa-secrets-{job.id}.txt"
+            mfa_path.write_text("\n".join(mfa_lines) + "\n", encoding="utf-8")
+            mfa_path.chmod(0o600)
+            job.mfa_secrets_path = str(mfa_path)
+            job.log(f"本次新绑定 MFA 账号 {len(mfa_lines)} 个，密钥已导出（务必下载保存）")
+        if job.stop_requested:
+            job.status = "stopped"
+            job.log(f"已中断：成功 {job.ok}，失败/跳过 {job.failed}，导出 {0 if options.get('api_key_only') else len(exported_all)} 条，API Key {len(api_keys_all)} 条（未完成的账号可重新提交）")
+        else:
+            job.status = "finished" if job.failed == 0 else "failed"
+            job.log(f"完成：成功 {job.ok}，失败 {job.failed}，导出 {0 if options.get('api_key_only') else len(exported_all)} 条，API Key {len(api_keys_all)} 条")
         audit("job.finished", jobId=job.id, customerId=job.customer_id, ok=job.ok, failed=job.failed, exported=0 if options.get("api_key_only") else len(exported_all), apiKeys=len(api_keys_all), path=str(out_path) if out_path else None, apiKeysPath=job.api_keys_path or None, apiKeyOnly=options.get("api_key_only"))
     except Exception as exc:
         job.status = "failed"
@@ -1038,6 +1145,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         return {
             "id": job.id,
             "status": job.status,
+            "stopRequested": job.stop_requested,
             "total": job.total,
             "done": job.done,
             "ok": job.ok,
@@ -1046,9 +1154,11 @@ def job_to_dict(job: Job) -> dict[str, Any]:
             "logs": list(job.logs),
             "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
             "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
+            "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
             "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
             "createdAt": int(job.created_at),
             "finishedAt": int(job.finished_at or 0),
+            "retryableCount": (len([a for a in job.accounts if a.email not in {r.email for r in job.results if r.ok}]) if (job.status in {"finished", "failed", "stopped"} and job.accounts) else 0),
             "results": [
                 {
                     "idx": r.idx,
@@ -1058,6 +1168,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
                     "changedPassword": r.changed_password,
                     "exportedCount": len(r.exported),
                     "apiKeyCount": len(r.api_keys),
+                    "mfaSecret": r.mfa_secret,
                 }
                 for r in job.results
             ],
@@ -1087,6 +1198,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
                 "expiresIn": None if not job.finished_at else max(0, int(EXPORT_TTL_SECONDS - (time.time() - age_base))),
                 "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
                 "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
+                "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
                 "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
             })
     return rows
@@ -1094,7 +1206,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
 
 def delete_job_files(job: Job) -> list[str]:
     deleted: list[str] = []
-    for path_attr in ("export_path", "api_keys_path", "log_path"):
+    for path_attr in ("export_path", "api_keys_path", "mfa_secrets_path", "log_path"):
         path_value = getattr(job, path_attr, "")
         if path_value:
             try:
@@ -1210,6 +1322,8 @@ def create_job():
         "strict_probe": bool(payload.get("strictProbe", False)),
     }
     with JOBS_LOCK:
+        job.accounts = accounts
+        job.options = options
         JOBS[job_id] = job
     save_job_history()
     audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], ip=client_ip())
@@ -1270,6 +1384,73 @@ def get_history():
     return jsonify({"items": customer_history(customer_id)})
 
 
+@app.post("/api/jobs/<job_id>/stop")
+def stop_job(job_id: str):
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job or job.customer_id != customer_id:
+            return jsonify({"error": "任务不存在"}), 404
+        if job.status not in {"queued", "running"}:
+            return jsonify({"error": "任务已结束，无需中断"}), 409
+        job.stop_requested = True
+        job.stop_event.set()
+    job.log("收到中断指令：正在停止未完成的账号（进行中的会在下一检查点退出，未开始的直接跳过）")
+    audit("job.stop_requested", jobId=job_id, customerId=customer_id, done=job.done, total=job.total, ip=client_ip())
+    return jsonify({"ok": True})
+
+
+@app.post("/api/jobs/<job_id>/retry")
+def retry_job(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    with JOBS_LOCK:
+        src = JOBS.get(job_id)
+        if not src or src.customer_id != customer_id:
+            return jsonify({"error": "任务不存在"}), 404
+        if src.status in {"queued", "running"}:
+            return jsonify({"error": "任务运行中，请先中断或等其结束再重试"}), 409
+        if not src.accounts:
+            return jsonify({"error": "该任务的账号数据已不在内存（可能服务重启过），请重新提交这几个号"}), 409
+        # 收集失败/未成功的 email（去重）
+        failed_emails = {r.email for r in src.results if not r.ok}
+        # 结果里根本没出现过的账号（被跳过）也算未成功
+        done_emails = {r.email for r in src.results if r.ok}
+        retry_accounts = [a for a in src.accounts if a.email not in done_emails]
+        if not retry_accounts:
+            return jsonify({"error": "没有需要重试的账号（全部已成功）"}), 400
+        options = dict(src.options or {})
+        if not options:
+            return jsonify({"error": "该任务配置已不在内存，请重新提交"}), 409
+    customer_active, global_active, browser_slots = active_job_counts(customer_id)
+    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
+        return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
+    if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
+        return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
+    # 重新编号 idx（1 起），保留原 email/password/proxy
+    accounts = [AccountInput(idx=i + 1, email=a.email, password=a.password, proxy=a.proxy) for i, a in enumerate(retry_accounts)]
+    threads = max(1, min(int(src.threads or 3), MAX_THREADS_PER_JOB, len(accounts)))
+    if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
+        return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
+    options["threads"] = threads
+    new_id = secrets.token_hex(8)
+    job = Job(id=new_id, customer_id=customer_id, total=len(accounts))
+    job.threads = threads
+    with JOBS_LOCK:
+        job.accounts = accounts
+        job.options = options
+        JOBS[new_id] = job
+    save_job_history()
+    audit("job.retried", jobId=new_id, fromJobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, ip=client_ip())
+    thread = threading.Thread(target=run_job, args=(job, accounts, options), daemon=True)
+    thread.start()
+    return jsonify({"jobId": new_id, "retryCount": len(accounts)})
+
+
 @app.delete("/api/jobs/<job_id>")
 def delete_job(job_id: str):
     customer_id = current_customer_id()
@@ -1312,6 +1493,19 @@ def download_job_api_keys(job_id: str):
         return jsonify({"error": "API Key 文件不存在"}), 404
     audit("apikeys.download", jobId=job.id, customerId=customer_id, path=job.api_keys_path, ip=client_ip())
     return send_file(job.api_keys_path, mimetype="text/plain", as_attachment=True, download_name=f"kiro-api-keys-{job_id}.txt")
+
+
+@app.get("/api/jobs/<job_id>/mfa-secrets/download")
+def download_job_mfa_secrets(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id or not job.mfa_secrets_path or not Path(job.mfa_secrets_path).exists() or Path(job.mfa_secrets_path).stat().st_size <= 0:
+        return jsonify({"error": "MFA 密钥文件不存在"}), 404
+    audit("mfa.download", jobId=job.id, customerId=customer_id, path=job.mfa_secrets_path, ip=client_ip())
+    return send_file(job.mfa_secrets_path, mimetype="text/plain", as_attachment=True, download_name=f"kiro-mfa-secrets-{job_id}.txt")
 
 
 @app.get("/api/jobs/<job_id>/logs/download")

@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.before-*
+debug_mfa/
+mfa_test_run.py
 
 .flask-secret
 customers.json

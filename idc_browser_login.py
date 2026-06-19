@@ -25,6 +25,8 @@ from typing import Callable, List, Optional
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
+import mfa_totp
+
 
 # Mac dinh
 DEFAULT_IDC_START_URL = "https://d-9066713dd7.awsapps.com/start"
@@ -51,6 +53,7 @@ class LoginOutcome:
     ok: bool
     changed_password: bool = False
     error: str = ""
+    mfa_secret: str = ""   # 若本次登录绑定了新 MFA，这里返回 AWS 生成的 TOTP 密钥（供回写保存）
 
 
 @dataclass
@@ -364,8 +367,14 @@ def drive_login(
     screen_w: int = 1920,
     screen_h: int = 1040,
     debug_dir: str = "",
+    mfa_secret: str = "",
+    on_secret=None,
 ) -> LoginOutcome:
-    """Mo Chromium sach, tu login trang device-code den khi bam 'Allow access'."""
+    """Mo Chromium sach, tu login trang device-code den khi bam 'Allow access'.
+
+    on_secret(secret): 抠到 AWS 新生成的 MFA 密钥的瞬间立刻回调（完整、不脱敏），
+    供上层立刻落盘，避免中途取消/超时导致密钥永久丢失。
+    """
     launch_args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
@@ -395,7 +404,8 @@ def drive_login(
         page.set_default_timeout(15000)
         try:
             return _flow(page, verification_uri_complete, email, password,
-                         new_password, log, stop_event, timeout_s, debug_dir)
+                         new_password, log, stop_event, timeout_s, debug_dir,
+                         known_mfa_secret=mfa_secret, on_secret=on_secret)
         except Exception as e:
             return LoginOutcome(False, error=f"loi browser: {e}")
         finally:
@@ -405,8 +415,176 @@ def drive_login(
                 pass
 
 
+# 验证码被 AWS 拒绝时页面常见的错误文案
+MFA_REJECT_MARKERS = (
+    "incorrect", "invalid", "not valid", "isn't valid", "does not match",
+    "doesn't match", "wrong", "try again", "expired", "无效", "不正确",
+    "错误", "不匹配", "重新",
+)
+
+
+def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
+                             on_secret=None) -> tuple[bool, str]:
+    """处理 AWS「绑定新 MFA」流程（身份验证程序 / authenticator app）。
+
+    步骤：
+      1. 若页面让选择 MFA 类型，点「身份验证程序 / Authenticator app」
+      2. 从页面抠出 AWS 生成的 secret key（mfa_totp.extract_secret_from_page）
+      3. 本地算 TOTP 验证码填入（有些页面要求连续两个验证码）
+      4. 提交后**验证 AWS 是否真的接受**（离开绑定页 / 出现 Allow access / success）
+    返回 (ok, secret)：ok=是否确认绑定成功；secret=AWS 生成的密钥（供回写保存）。
+
+    关键修复：旧版只要填了码、点了按钮就 `return True`，从不校验结果。
+    若 AWS 因验证码错误/页面未真正提交而仍停在 MFA 页，主循环会因 mfa_secret
+    已设而永久跳过 MFA 分支，表现为「卡在等待 Allow access 直到超时」。
+    现在：提交后必须确认离开绑定页才算成功，否则换下一个 TOTP 窗口重试。
+
+    密钥保全：抠到密钥的**瞬间**就通过 on_secret(secret) 回调落盘（完整、不脱敏），
+    不等绑定结果。即使后续被取消/超时/AWS 卡住，密钥也已安全保存，绝不再丢失。
+    """
+    import time as _t
+
+    def shot(tag):
+        if _shot:
+            try:
+                _shot(tag)
+            except Exception:
+                pass
+
+    def code_inputs():
+        return page.locator(
+            "input[type=text]:visible, input[type=tel]:visible, "
+            "input[name*=code i]:visible, input[name*=otp i]:visible, "
+            "input[name*=mfa i]:visible"
+        )
+
+    def still_on_mfa() -> bool:
+        try:
+            b = _body_text(page).lower()
+        except Exception:
+            return True
+        if any(s in b for s in SUCCESS_MARKERS):
+            return False
+        return any(m in b for m in MFA_MARKERS)
+
+    def left_mfa_ok() -> bool:
+        # 离开绑定页 / 出现授权页 / success 标记 = 绑定被接受
+        try:
+            b = _body_text(page).lower()
+        except Exception:
+            b = ""
+        if any(s in b for s in SUCCESS_MARKERS):
+            return True
+        if _is_button_visible(page, "Allow access") or _is_button_visible(page, "Confirm and continue"):
+            return True
+        return not any(m in b for m in MFA_MARKERS)
+
+    secret = known_secret or ""
+    if not secret:
+        # 1) 选择 authenticator app 类型（若有选项页）。重试时已在验证码页，跳过。
+        for label in ("Authenticator app", "authenticator app", "身份验证程序",
+                      "Authenticator", "Virtual", "TOTP"):
+            try:
+                loc = page.get_by_text(label, exact=False)
+                if loc.count() > 0:
+                    loc.first.click(timeout=1500)
+                    log(f"    MFA: 选择「{label}」")
+                    page.wait_for_timeout(500)
+                    break
+            except Exception:
+                pass
+        # 可能需要点 Next / Continue 进入密钥展示页
+        _click_button(page, ["Next", "Continue", "下一步", "继续"], log, timeout=1500)
+        page.wait_for_timeout(400)
+        shot("mfa_setup_page")
+
+        # 2) 抠 secret key
+        secret = mfa_totp.extract_secret_from_page(page, log)
+        if not secret:
+            return False, ""
+        log(f"    MFA: 获取密钥成功（{secret[:4]}…{secret[-4:]}），本地计算验证码")
+        # 立刻完整落盘（不等绑定结果），防止取消/超时导致密钥永久丢失
+        if on_secret:
+            try:
+                on_secret(secret)
+            except Exception:
+                pass
+    else:
+        log(f"    MFA: 复用已抓取密钥（{secret[:4]}…{secret[-4:]}），重试验证码")
+
+    # 3) 填码 + 提交 + 校验结果，最多 4 轮；每轮换新的 TOTP 窗口，避免重复用同一个码
+    for attempt in range(1, 5):
+        try:
+            n = code_inputs().count()
+        except Exception:
+            n = 0
+
+        if n == 0:
+            # 没有验证码输入框：可能已离开绑定页 = 成功
+            if left_mfa_ok():
+                log("    MFA: 已无验证码框且离开绑定页，视为绑定成功")
+                return True, secret
+            page.wait_for_timeout(700)
+            continue
+
+        code = mfa_totp.totp_now(secret)
+        if n >= 2:
+            # 两框同屏：第一个填当前码，第二个等下一周期再填
+            try:
+                code_inputs().nth(0).fill(code)
+            except Exception:
+                pass
+            wait = 31 - (int(_t.time()) % 30)
+            log(f"    MFA: 需第二个连续码，等 {wait}s 到下一周期")
+            _t.sleep(min(wait, 32))
+            code2 = mfa_totp.totp_now(secret)
+            try:
+                code_inputs().nth(1).fill(code2)
+            except Exception:
+                pass
+        else:
+            try:
+                code_inputs().nth(0).fill(code)
+            except Exception:
+                return False, secret
+
+        shot(f"mfa_code_filled_{attempt}")
+        _click_button(page, ["Assign MFA", "Add MFA", "Register", "Confirm",
+                             "Verify", "Submit", "Continue", "Next", "绑定", "确认", "提交"], log)
+        page.wait_for_timeout(1600)
+        shot(f"mfa_after_submit_{attempt}")
+
+        # —— 校验：是否真的被接受 ——
+        if left_mfa_ok():
+            log("    MFA: 提交后已离开绑定页/出现授权页，绑定成功")
+            return True, secret
+
+        # 仍在绑定页：检查是否报错（验证码被拒）
+        try:
+            body_now = _body_text(page).lower()
+        except Exception:
+            body_now = ""
+        err = ""
+        try:
+            err = _visible_error_text(page) or ""
+        except Exception:
+            err = ""
+        rejected = bool(err) or any(m in body_now for m in MFA_REJECT_MARKERS)
+        if rejected:
+            log(f"    MFA: 验证码被拒（{err or '页面提示无效/重试'}），换下一窗口码重试")
+        else:
+            log("    MFA: 提交后仍停留绑定页，换下一窗口码重试")
+
+        # 等到下一个 TOTP 窗口，避免重复使用刚才那个码
+        wait = 31 - (int(_t.time()) % 30)
+        _t.sleep(min(wait, 32))
+
+    log("    MFA: 多轮提交后仍未离开绑定页，放弃本次绑定")
+    return False, secret
+
+
 def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
-          debug_dir: str = "") -> LoginOutcome:
+          debug_dir: str = "", known_mfa_secret: str = "", on_secret=None) -> LoginOutcome:
     safe = "".join(c if c.isalnum() else "_" for c in (email or "acc"))[:20]
     shot = {"i": 0}
 
@@ -437,6 +615,12 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
     user_attempts = 0
     idle_rounds = 0
     seen_password = False
+    # 已绑定 MFA 的账号：用户提前提供 TOTP 密钥（base32），登录时直接用它算验证码。
+    # 新账号首次绑定：留空，AWS 会展示密钥，由 _handle_mfa_registration 自动抠出来。
+    mfa_secret = mfa_totp.normalize_secret(known_mfa_secret) if known_mfa_secret else ""
+    if mfa_secret:
+        log(f"    MFA: 已注入预设密钥（{mfa_secret[:4]}…{mfa_secret[-4:]}），将用于 TOTP 验证")
+    mfa_attempts = 0
 
     while time.time() < deadline:
         if stop_event is not None and stop_event.is_set():
@@ -445,15 +629,35 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
         _maybe_cookie_accept(page, log)
         body = _body_text(page).lower()
 
-        # --- MFA (user da xac nhan khong co; neu gap -> bao loi ro) ---
+        # --- MFA 绑定：新账号首次被要求绑定 authenticator。
+        #     自动抠密钥 + 本地算 TOTP 填入完成绑定，并保存密钥。
+        #     修复：只要页面还在 MFA 绑定页就继续处理（不再用 not mfa_secret 守卫永久跳过），
+        #     已抠到密钥的重试直接复用。---
         if any(m in body for m in MFA_MARKERS):
-            return LoginOutcome(False, changed,
-                                "Gap buoc MFA/2FA - account nay co bao mat 2 lop, dung lai.")
+            mfa_attempts += 1
+            if mfa_attempts > 3:
+                return LoginOutcome(
+                    False, changed,
+                    "MFA 绑定多次未完成（未抓到密钥或验证码被拒）",
+                    mfa_secret=mfa_secret,
+                )
+            log("    检测到 MFA 绑定页，尝试自动绑定 authenticator")
+            ok_mfa, sec = _handle_mfa_registration(page, log, _shot, known_secret=mfa_secret,
+                                                   on_secret=on_secret)
+            if sec:
+                mfa_secret = sec
+            if not ok_mfa:
+                # 未抠到密钥或提交未被接受：稍等后主循环重新进入本分支重试
+                time.sleep(1.0)
+                continue
+            idle_rounds = 0
+            time.sleep(1.0)
+            continue
 
         # --- da Allow xong / approved ---
         if any(m in body for m in SUCCESS_MARKERS):
             log("    -> approved")
-            return LoginOutcome(True, changed)
+            return LoginOutcome(True, changed, mfa_secret=mfa_secret)
 
         pw_n = _count_visible(page, "input[type=password]")
         text_n = _count_visible(page, "input[type=text]:not([type=hidden])")
@@ -464,7 +668,7 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
         if has_allow:
             if _click_button(page, ["Allow access"], log):
                 time.sleep(0.8)
-                return LoginOutcome(True, changed)   # approve xong -> poll se lay token
+                return LoginOutcome(True, changed, mfa_secret=mfa_secret)   # approve xong -> poll se lay token
 
         # --- consent: Confirm and continue (xac nhan user_code) ---
         if has_confirm:
