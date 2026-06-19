@@ -74,6 +74,7 @@ DEFAULT_START_URL = idc.DEFAULT_IDC_START_URL
 DEFAULT_NEW_PASSWORD = idc.DEFAULT_NEW_PASSWORD
 PROFILE_SCAN_REGIONS = ("us-east-1", "eu-central-1")
 ACCOUNT_SEP_RE = re.compile(r"[\t,;|]")
+AWS_BLOCK_FIELD_RE = re.compile(r"^\s*([^:]+):\s*(.*)\s*$", re.M)
 KIRO_PROFILE_API_VERSION = "0.12.333"
 BLOCKED_PROXY_HOSTS = ("127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "192.168.", "localhost", "0.0.0.0", "::1")
 
@@ -599,15 +600,59 @@ def _looks_like_mfa_secret(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Z2-7]+", v))
 
 
+def _parse_aws_access_portal_blocks(text: str) -> list[AccountInput]:
+    """解析 AWS access portal 文本块。
+
+    支持直接粘贴 mmostore/AWS 导出的格式，例如：
+      Default AWS access portal URL (IPv4 only): https://d-xxx.awsapps.com/start
+      Dual-stack AWS access portal URL: https://...
+      Username: xxxxx
+      One-time password: yyyyy
+
+    这里账号字段名仍沿用 AccountInput.email，实际可为 AWS username。
+    """
+    accounts: list[AccountInput] = []
+    fields: dict[str, str] = {}
+
+    def flush() -> None:
+        username = fields.get("username", "").strip()
+        password = fields.get("one-time password", "").strip() or fields.get("password", "").strip()
+        if username and password:
+            accounts.append(AccountInput(idx=len(accounts) + 1, email=username, password=password))
+        fields.clear()
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            flush()
+            continue
+        match = AWS_BLOCK_FIELD_RE.match(line)
+        if not match:
+            continue
+        key = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        value = match.group(2).strip()
+        if key.startswith("default aws access portal url") and fields.get("username") and fields.get("one-time password"):
+            flush()
+        if key in {"username", "one-time password", "password"} or key.startswith("default aws access portal url") or key.startswith("dual-stack aws access portal url"):
+            fields[key] = value
+    flush()
+    return accounts
+
+
 def parse_accounts(text: str) -> list[AccountInput]:
     """解析账号输入。支持格式（分隔符可用空格/tab/逗号/分号/竖线/冒号）：
       email password                       # 最简
       email password proxy                 # 带代理
       email password mfa_secret            # 已绑定 MFA（自动识别 base32 密钥）
       email password proxy mfa_secret      # 代理 + MFA
+      AWS access portal 文本块              # Username + One-time password
     第 3 段会自动判断是代理还是 MFA 密钥：看起来像 base32 密钥就当 MFA，
     否则当代理。无需 mfa= 前缀。mfa_secret 是 authenticator app 导出的 base32（A-Z 2-7）。
     """
+    aws_accounts = _parse_aws_access_portal_blocks(text)
+    if aws_accounts:
+        return aws_accounts
+
     accounts: list[AccountInput] = []
     for idx, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -1432,7 +1477,7 @@ def retry_job(job_id: str):
     if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
         return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
     # 重新编号 idx（1 起），保留原 email/password/proxy
-    accounts = [AccountInput(idx=i + 1, email=a.email, password=a.password, proxy=a.proxy) for i, a in enumerate(retry_accounts)]
+    accounts = [AccountInput(idx=i + 1, email=a.email, password=a.password, proxy=a.proxy, mfa_secret=a.mfa_secret) for i, a in enumerate(retry_accounts)]
     threads = max(1, min(int(src.threads or 3), MAX_THREADS_PER_JOB, len(accounts)))
     if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
         return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
