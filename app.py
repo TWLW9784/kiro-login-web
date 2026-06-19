@@ -703,6 +703,38 @@ def parse_accounts(text: str) -> list[AccountInput]:
     return accounts
 
 
+def load_known_mfa_secrets(customer_id: str) -> dict[str, str]:
+    secrets_by_email: dict[str, str] = {}
+    base = Path(__file__).parent / "exports" / customer_id
+    if not base.exists():
+        return secrets_by_email
+    for path in sorted(base.glob("kiro-mfa-secrets*.txt"), key=lambda p: p.stat().st_mtime):
+        try:
+            for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if ":" not in raw:
+                    continue
+                email, secret = raw.split(":", 1)
+                email = email.strip()
+                secret = secret.strip()
+                if email and _looks_like_mfa_secret(secret):
+                    secrets_by_email[email] = secret
+        except Exception:
+            continue
+    return secrets_by_email
+
+
+def enrich_accounts_with_known_mfa(accounts: list[AccountInput], customer_id: str) -> int:
+    known = load_known_mfa_secrets(customer_id)
+    if not known:
+        return 0
+    updated = 0
+    for acc in accounts:
+        if not acc.mfa_secret and acc.email in known:
+            acc.mfa_secret = known[acc.email]
+            updated += 1
+    return updated
+
+
 def sanitize_proxy(proxy: str) -> str:
     proxy = (proxy or "").strip()
     if not proxy:
@@ -1353,6 +1385,7 @@ def create_job():
     accounts = parse_accounts(payload.get("accounts", ""))
     if not accounts:
         return jsonify({"error": "没有解析到账号，请按 email:password 每行一个填写"}), 400
+    enriched_mfa = enrich_accounts_with_known_mfa(accounts, customer_id)
     if len(accounts) > MAX_ACCOUNTS_PER_JOB:
         return jsonify({"error": f"单次最多提交 {MAX_ACCOUNTS_PER_JOB} 个账号"}), 400
     customer_active, global_active, browser_slots = active_job_counts(customer_id)
@@ -1394,7 +1427,9 @@ def create_job():
         job.options = options
         JOBS[job_id] = job
     save_job_history()
-    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], ip=client_ip())
+    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], knownMfa=enriched_mfa, ip=client_ip())
+    if enriched_mfa:
+        job.log(f"已自动复用历史 MFA 密钥 {enriched_mfa} 个；如这些账号已绑定 MFA，可直接完成验证码登录")
     thread = threading.Thread(target=run_job, args=(job, accounts, options), daemon=True)
     thread.start()
     return jsonify({"jobId": job_id})

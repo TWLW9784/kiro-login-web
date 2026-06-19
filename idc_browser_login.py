@@ -647,6 +647,9 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
     deadline = time.time() + timeout_s
     changed = False
     pw_attempts = 0
+    password_candidates = [password]
+    if new_password and new_password != password:
+        password_candidates.append(new_password)
     change_pw_attempts = 0
     user_attempts = 0
     idle_rounds = 0
@@ -774,14 +777,15 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
         if pw_n == 1:
             seen_password = True
             pw_attempts += 1
-            log(f"    nhap password (lan {pw_attempts})")
+            candidate = password_candidates[min(pw_attempts - 1, len(password_candidates) - 1)]
+            log(f"    nhap password (lan {pw_attempts})" + ("，尝试首次登录新密码" if candidate == new_password and candidate != password else ""))
             _wait_metadata1(page)            # cho token anti-bot truoc khi dien
-            _fill_first_visible(page, "input[type=password]", password)
+            _fill_first_visible(page, "input[type=password]", candidate)
             _shot("pw_filled")
             if debug_dir:
                 try:
                     val = page.locator("input[type=password] >> visible=true").first.input_value()
-                    log(f"    [debug] o password dang chua: {val!r} (khop pass={val == password})")
+                    log(f"    [debug] o password dang chua: {val!r} (khop pass={val == candidate})")
                 except Exception:
                     pass
             if not _wait_metadata1(page):
@@ -798,11 +802,11 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                 idle_rounds = 0
                 continue
             detail = _visible_error_text(page)
-            if pw_attempts >= 2:
+            if pw_attempts >= len(password_candidates):
                 return LoginOutcome(
                     False, changed,
                     f"Login that bai o trang password: {detail or 'khong qua duoc (sai pass?)'}")
-            log(f"    chua qua password ({detail or 'thu lai'}) -> thu lai")
+            log(f"    chua qua password ({detail or 'thu lai'}) -> 换下一个候选密码重试")
             idle_rounds = 0
             continue
 
