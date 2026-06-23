@@ -6,11 +6,15 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -21,7 +25,7 @@ jobs:
             asset_name: kiro-login-web-windows-amd64.exe
           - os: macos-latest
             artifact_name: kiro-login-web-macos
-            asset_name: kiro-login-web-macos-amd64
+            asset_name: kiro-login-web-macos-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -37,18 +41,12 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Install Playwright browsers
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
-
       - name: Build with PyInstaller (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           pyinstaller --onefile \
             --name "${{ matrix.artifact_name }}" \
             --add-data "templates:templates" \
-            --add-data "static:static" \
             --hidden-import=playwright \
             --hidden-import=pyotp \
             --collect-all playwright \
@@ -60,52 +58,57 @@ jobs:
           pyinstaller --onefile `
             --name "${{ matrix.artifact_name }}" `
             --add-data "templates;templates" `
-            --add-data "static;static" `
             --hidden-import=playwright `
             --hidden-import=pyotp `
             --collect-all playwright `
             app.py
 
+      - name: Rename artifact
+        shell: bash
+        run: |
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv "${{ matrix.artifact_name }}.exe" "${{ matrix.asset_name }}"
+          else
+            mv "${{ matrix.artifact_name }}" "${{ matrix.asset_name }}"
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: |
-            dist/${{ matrix.artifact_name }}
-            dist/${{ matrix.artifact_name }}.exe
+          path: dist/${{ matrix.asset_name }}
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts
 
       - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           body: |
             Kiro 批量登录与凭据导出工具
 
             ## 下载
             - **Windows**: `kiro-login-web-windows-amd64.exe`
             - **Linux**: `kiro-login-web-linux-amd64`
-            - **macOS**: `kiro-login-web-macos-amd64`
+            - **macOS (Apple Silicon)**: `kiro-login-web-macos-arm64`
 
             ## 使用
             1. 下载对应平台的可执行文件
-            2. 双击运行（Windows）或命令行执行（Linux/macOS）
-            3. 浏览器打开 http://localhost:7888
-            4. 首次运行会自动安装 Playwright 浏览器
+            2. 运行后浏览器打开 http://localhost:7888
+            3. 首次运行需要本机已安装 Chromium（程序会尝试自动下载）
 
             ## 功能
             - AWS access portal 批量登录
@@ -113,35 +116,6 @@ jobs:
             - 凭据导出（总 JSON / 拆分 ZIP）
             - 固定/随机密码模式
             - 并行登录（默认 10 并发）
+          files: artifacts/**/*
           draft: false
           prerelease: false
-
-      - name: Upload Windows binary
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/kiro-login-web-windows-amd64.exe/kiro-login-web-windows.exe
-          asset_name: kiro-login-web-windows-amd64.exe
-          asset_content_type: application/octet-stream
-
-      - name: Upload Linux binary
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/kiro-login-web-linux-amd64/kiro-login-web-linux
-          asset_name: kiro-login-web-linux-amd64
-          asset_content_type: application/octet-stream
-
-      - name: Upload macOS binary
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/kiro-login-web-macos-amd64/kiro-login-web-macos
-          asset_name: kiro-login-web-macos-amd64
-          asset_content_type: application/octet-stream
