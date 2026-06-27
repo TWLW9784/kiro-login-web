@@ -1599,6 +1599,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
             "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
             "createdAt": int(job.created_at),
             "finishedAt": int(job.finished_at or 0),
+            "expiresIn": None if not job.finished_at else max(0, int(EXPORT_TTL_SECONDS - (time.time() - job.finished_at))),
             "retryableCount": (
                 len([a for a in job.accounts if (a.idx, a.email) not in {(r.idx, r.email) for r in job.results if r.ok}])
                 if (job.status in {"finished", "failed", "stopped"} and job.accounts)
