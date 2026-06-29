@@ -78,6 +78,8 @@ def add_no_cache_headers(response):
 
 JOBS: dict[str, "Job"] = {}
 JOBS_LOCK = threading.RLock()
+# 调度器唤醒事件：提交/完成任务后置位，让调度器立即检查是否有可启动的排队任务。
+SCHEDULER_WAKE = threading.Event()
 CUSTOMERS_PATH = Path(__file__).parent / "customers.json"
 CUSTOMERS_LOCK = threading.RLock()
 HISTORY_PATH = Path(__file__).parent / "data" / "job_history.json"
@@ -93,6 +95,11 @@ MAX_ACTIVE_JOBS_PER_CUSTOMER = 2
 MAX_ACTIVE_JOBS_GLOBAL = 8
 MAX_THREADS_PER_JOB = 10
 MAX_BROWSER_SLOTS_GLOBAL = 20
+# 排队容量：超过并发上限的任务不再直接 429 拒绝，而是进队等待调度。
+# 仅对「排队+运行」总数设上限，防止内存滥用/滥提交。
+MAX_QUEUED_JOBS_PER_CUSTOMER = 6
+MAX_TOTAL_JOBS_GLOBAL = 60
+SCHEDULER_INTERVAL_SECONDS = 2
 DEFAULT_START_URL = idc.DEFAULT_IDC_START_URL
 DEFAULT_NEW_PASSWORD = idc.DEFAULT_NEW_PASSWORD
 PROFILE_SCAN_REGIONS = ("us-east-1", "eu-central-1")
@@ -659,6 +666,8 @@ class Job:
     # 仅内存保留（不入持久化/不传前端），用于「重试失败项」重建账号
     accounts: list["AccountInput"] = field(default_factory=list, repr=False)
     options: dict[str, Any] = field(default_factory=dict, repr=False)
+    # JSON 开通 API Key 任务排队期间暂存的凭据行（仅内存，调度启动时取用）
+    rows: list[dict[str, str]] = field(default_factory=list, repr=False)
 
     def log(self, message: str) -> None:
         simplified = simplify_job_message(message)
@@ -934,6 +943,63 @@ def random_account_password() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
     core = "".join(secrets.choice(alphabet) for _ in range(18))
     return f"Kiro@{core}#"
+
+
+# 全角/中文标点 → 半角 ASCII 标点映射。
+# 场景：用户在中文输入法下复制密码，符号可能被输成全角（＠！＃）等），
+# 与 AWS 实际密码不一致导致登录/改密失败。这里只转换标点与空格，不动字母/汉字。
+_FULLWIDTH_SYMBOL_MAP = {
+    "！": "!", "＂": '"', "＃": "#", "＄": "$", "％": "%", "＆": "&",
+    "＇": "'", "（": "(", "）": ")", "＊": "*", "＋": "+", "，": ",",
+    "－": "-", "．": ".", "／": "/", "：": ":", "；": ";", "＜": "<",
+    "＝": "=", "＞": ">", "？": "?", "＠": "@", "［": "[", "＼": "\\",
+    "］": "]", "＾": "^", "＿": "_", "｀": "`", "｛": "{", "｜": "|",
+    "｝": "}", "～": "~",
+    # 常见中文标点
+    "。": ".", "，": ",", "、": ",", "；": ";", "：": ":",
+    "“": '"', "”": '"', "‘": "'", "’": "'",
+    "（": "(", "）": ")", "【": "[", "】": "]", "《": "<", "》": ">",
+    "！": "!", "？": "?", "～": "~", "·": ".", "—": "-", "－": "-",
+    "　": " ",
+}
+
+
+def normalize_fullwidth_symbols(text: str) -> tuple[str, int]:
+    """将字符串中的全角/中文标点转为半角 ASCII。返回 (转换后文本, 改动字符数)。
+
+    优先查显式映射表；未命中但落在全角 ASCII 区（U+FF01..U+FF5E）的字符
+    按 − 0xFEE0 转为对应半角。只动能明确映射的字符，其余原样保留。
+    """
+    if not text:
+        return text, 0
+    out: list[str] = []
+    changed = 0
+    for ch in text:
+        repl = _FULLWIDTH_SYMBOL_MAP.get(ch)
+        if repl is None:
+            code = ord(ch)
+            if 0xFF01 <= code <= 0xFF5E:
+                repl = chr(code - 0xFEE0)
+        if repl is not None and repl != ch:
+            out.append(repl)
+            changed += 1
+        else:
+            out.append(ch)
+    return "".join(out), changed
+
+
+def normalize_accounts_symbols(accounts: list["AccountInput"]) -> int:
+    """对账号列表的密码全角标点做半角归一化，返回发生转换的账号数。
+
+    只动密码（用户原始密码）；email/代理/MFA 不动，避免误伤。
+    """
+    affected = 0
+    for acc in accounts:
+        new_pwd, changed = normalize_fullwidth_symbols(acc.password)
+        if changed:
+            acc.password = new_pwd
+            affected += 1
+    return affected
 
 
 def stronger_account_password() -> str:
@@ -1316,6 +1382,7 @@ def run_json_api_key_job(job: Job, rows: list[dict[str, str]], options: dict[str
     finally:
         job.finished_at = time.time()
         save_job_history()
+        SCHEDULER_WAKE.set()
 
 
 def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResult:
@@ -1578,6 +1645,7 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
     finally:
         job.finished_at = time.time()
         save_job_history()
+        SCHEDULER_WAKE.set()
 
 
 def job_to_dict(job: Job) -> dict[str, Any]:
@@ -1678,17 +1746,85 @@ def active_job_counts(customer_id: str) -> tuple[int, int, int]:
 
 
 def can_enqueue_locked(customer_id: str, requested_threads: int, uses_browser: bool) -> tuple[bool, str]:
-    active = [job for job in JOBS.values() if job.status in {"queued", "running"}]
-    customer_active = sum(1 for job in active if job.customer_id == customer_id)
-    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
-        return False, f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"
-    if len(active) >= MAX_ACTIVE_JOBS_GLOBAL:
-        return False, "当前服务器任务繁忙，请稍后再试"
-    if uses_browser:
-        browser_slots = sum(max(1, job.threads) for job in active if job.uses_browser)
-        if browser_slots + requested_threads > MAX_BROWSER_SLOTS_GLOBAL:
-            return False, f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"
+    """准入闸（宽松）：只限制排队深度/总量，不再因“并发满”拒绝。
+
+    超过运行并发上限的任务会进入 queued 状态，由调度器在有容量时再启动。
+    这里仅防止单客户/全局排队过多导致内存滥用。
+    """
+    pending = [job for job in JOBS.values() if job.status in {"queued", "running"}]
+    customer_pending = sum(1 for job in pending if job.customer_id == customer_id)
+    if customer_pending >= MAX_QUEUED_JOBS_PER_CUSTOMER:
+        return False, f"你同时排队/运行的任务已达上限 {MAX_QUEUED_JOBS_PER_CUSTOMER} 个，请等现有任务完成再提交"
+    if len(pending) >= MAX_TOTAL_JOBS_GLOBAL:
+        return False, "服务器排队已满，请稍后再试"
     return True, ""
+
+
+def can_start_locked(job: "Job") -> bool:
+    """启动闸（严格）：只看「正在运行」的任务占用，决定一个排队任务是否可以现在起跑。
+
+    关键：只统计 status==running（不含 queued），否则排队任务会把名额算在自己头上、永远启不了。
+    """
+    running = [j for j in JOBS.values() if j.status == "running"]
+    if len(running) >= MAX_ACTIVE_JOBS_GLOBAL:
+        return False
+    customer_running = sum(1 for j in running if j.customer_id == job.customer_id)
+    if customer_running >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
+        return False
+    if job.uses_browser:
+        browser_slots = sum(max(1, j.threads) for j in running if j.uses_browser)
+        if browser_slots + max(1, job.threads) > MAX_BROWSER_SLOTS_GLOBAL:
+            return False
+    return True
+
+
+def _launch_job_locked(job: "Job") -> None:
+    """在持锁状态下把一个 queued 任务置为 running 并启线程。
+
+    先置 running 再启线程，避免调度器下一轮双算/重复启动。
+    """
+    job.status = "running"
+    if job.kind == "json_api_key":
+        opts = {
+            "threads": job.threads,
+            "api_key_label": (job.options or {}).get("api_key_label") or "1",
+        }
+        threading.Thread(target=run_json_api_key_job, args=(job, job.rows, opts), daemon=True).start()
+    else:
+        threading.Thread(target=run_job, args=(job, job.accounts, job.options), daemon=True).start()
+
+
+def schedule_pending_jobs() -> None:
+    """扫描排队任务，按创建时间 FIFO 顺序在有容量时启动。"""
+    with JOBS_LOCK:
+        queued = sorted(
+            (j for j in JOBS.values() if j.status == "queued"),
+            key=lambda j: j.created_at,
+        )
+        for job in queued:
+            if job.stop_requested or job.stop_event.is_set():
+                job.status = "stopped"
+                job.finished_at = time.time()
+                continue
+            if can_start_locked(job):
+                _launch_job_locked(job)
+
+
+def scheduler_loop() -> None:
+    while True:
+        SCHEDULER_WAKE.wait(timeout=SCHEDULER_INTERVAL_SECONDS)
+        SCHEDULER_WAKE.clear()
+        try:
+            schedule_pending_jobs()
+        except Exception as exc:
+            logger.warning("scheduler loop error: %s", exc)
+
+
+def enqueue_job_locked(job: "Job") -> None:
+    """登记任务为 queued 并唤醒调度器（调用方需持有 JOBS_LOCK）。"""
+    job.status = "queued"
+    JOBS[job.id] = job
+    SCHEDULER_WAKE.set()
 
 
 @app.get("/login")
@@ -1752,6 +1888,9 @@ def create_job():
     accounts = parse_accounts(payload.get("accounts", ""), mode=(payload.get("accountMode") or "auto"))
     if not accounts:
         return jsonify({"error": "没有解析到账号，请按 email:password 每行一个填写"}), 400
+    # 全角/中文符号 → 半角（默认开）：防止中文输入法下密码符号不一致导致登录失败
+    normalize_symbols = payload.get("normalizeSymbols", True)
+    symbol_fixed = normalize_accounts_symbols(accounts) if normalize_symbols else 0
     enriched_mfa = enrich_accounts_with_known_mfa(accounts, customer_id)
     if len(accounts) > MAX_ACCOUNTS_PER_JOB:
         return jsonify({"error": f"单次最多提交 {MAX_ACCOUNTS_PER_JOB} 个账号"}), 400
@@ -1769,11 +1908,14 @@ def create_job():
     job = Job(id=job_id, customer_id=customer_id, total=len(accounts), threads=threads, kind="login", uses_browser=True)
     login_timeout = clamp_int(payload.get("loginTimeout"), 180, 60, 600)
     password_mode = "fixed" if payload.get("passwordMode") == "fixed" else "random"
+    fixed_new_password = payload.get("newPassword") or DEFAULT_NEW_PASSWORD
+    if normalize_symbols and password_mode == "fixed":
+        fixed_new_password, _ = normalize_fullwidth_symbols(fixed_new_password)
     options = {
         "start_url": start_url_or_error,
         "oidc_region": dca.normalize_oidc_region(payload.get("oidcRegion") or dca.DEFAULT_OIDC_REGION),
         "kiro_region": dca.normalize_kiro_region(payload.get("kiroRegion") or dca.DEFAULT_KIRO_REGION),
-        "new_password": payload.get("newPassword") or DEFAULT_NEW_PASSWORD,
+        "new_password": fixed_new_password,
         "password_mode": password_mode,
         "headless": True,
         "threads": threads,
@@ -1790,13 +1932,13 @@ def create_job():
             return jsonify({"error": enqueue_error}), 429
         job.accounts = accounts
         job.options = options
-        JOBS[job_id] = job
+        enqueue_job_locked(job)
     save_job_history()
     audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], knownMfa=enriched_mfa, ip=client_ip())
     if enriched_mfa:
         job.log(f"已自动复用历史 MFA 密钥 {enriched_mfa} 个；如这些账号已绑定 MFA，可直接完成验证码登录")
-    thread = threading.Thread(target=run_job, args=(job, accounts, options), daemon=True)
-    thread.start()
+    if symbol_fixed:
+        job.log(f"已自动将 {symbol_fixed} 个账号密码中的全角/中文符号转为半角英文")
     return jsonify({"jobId": job_id})
 
 
@@ -1822,11 +1964,11 @@ def create_json_api_key_job():
         ok_enqueue, enqueue_error = can_enqueue_locked(customer_id, threads, False)
         if not ok_enqueue:
             return jsonify({"error": enqueue_error}), 429
-        JOBS[job_id] = job
+        job.rows = rows
+        job.options = {"threads": threads, "api_key_label": label}
+        enqueue_job_locked(job)
     save_job_history()
     audit("json_apikey_job.created", jobId=job_id, customerId=customer_id, total=len(rows), threads=threads, ip=client_ip())
-    thread = threading.Thread(target=run_json_api_key_job, args=(job, rows, {"threads": threads, "api_key_label": label}), daemon=True)
-    thread.start()
     return jsonify({"jobId": job_id})
 
 
@@ -1903,11 +2045,9 @@ def retry_job(job_id: str):
             return jsonify({"error": enqueue_error}), 429
         job.accounts = accounts
         job.options = options
-        JOBS[new_id] = job
+        enqueue_job_locked(job)
     save_job_history()
     audit("job.retried", jobId=new_id, fromJobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, ip=client_ip())
-    thread = threading.Thread(target=run_job, args=(job, accounts, options), daemon=True)
-    thread.start()
     return jsonify({"jobId": new_id, "retryCount": len(accounts)})
 
 
@@ -2013,6 +2153,7 @@ def main() -> None:
     restore_job_history()
     restore_jobs_from_exports()
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7888)
