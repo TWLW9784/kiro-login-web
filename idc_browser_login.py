@@ -394,6 +394,17 @@ def drive_login(
         "--disable-dev-shm-usage",
         "--disable-background-networking",
         "--disable-renderer-backgrounding",
+        # 以下均为省 CPU/内存的标准 headless 参数：高并发时把 CPU 从
+        # 渲染/GPU/后台任务上省下来，腾给反爬 token 的 JS 计算（实测
+        # 4 核跑 10 并发时 token 生成被拖慢近 3×）。不禁 JS、不影响反爬检测。
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-timer-throttling",
+        "--disable-hang-monitor",
+        "--disable-features=TranslateUI,BackForwardCache",
+        "--metrics-recording-only",
+        "--no-first-run",
+        "--mute-audio",
     ]
     if not headless:
         launch_args += _tile_args(window_index, window_count, screen_w, screen_h)
@@ -815,6 +826,12 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                 idle_rounds = 0
                 continue
             detail = _visible_error_text(page)
+            # captcha 专项识别：触发人机验证时，再试密码也没用（验证码会一直在），直接明确报错。
+            if detail and any(m in detail.lower() for m in ("captcha", "验证码", "are you human", "robot")):
+                _shot("captcha")
+                return LoginOutcome(
+                    False, changed,
+                    f"触发 AWS 人机验证 captcha（{detail}）：请降低并发至 1~2 并挂代理（不同 IP）后重试")
             if pw_attempts >= len(password_candidates):
                 return LoginOutcome(
                     False, changed,
