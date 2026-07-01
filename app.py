@@ -183,6 +183,11 @@ if not logger.handlers:
     stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(stream_handler)
 
+# 降噪：werkzeug 默认把每个 HTTP 请求（含前端每 1.5~5s 的 /api/history、/api/jobs 轮询）都写访问日志，
+# 导致 server.log 迅速膨胀（曾达 23MB / 38 万行，其中 15%+ 是 history 轮询）。
+# 改为只记 WARNING 及以上（错误/异常仍保留），业务事件走上方自定义 logger（app.log，带轮转）。
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
 
 def client_ip() -> str:
     forwarded = request.headers.get("X-Forwarded-For", "") if request else ""
