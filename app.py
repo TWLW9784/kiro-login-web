@@ -1693,7 +1693,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             except Exception:
                 pass
             saved_pw["done"] = True
-            log(f"新密码已立刻落盘：{early_pw_path.name}（改密成功即保存，防丢号）")
+            log(f"新密码已立刻落盘：{acc.email} → {new_pw}（已写入 {early_pw_path.name}，改密成功即保存，防丢号）")
             save_job_history()
             audit("password.early_saved", jobId=job.id, customerId=job.customer_id, email=acc.email)
         except Exception as exc:
@@ -1846,6 +1846,10 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     suffix = f"，apiKeys={len(api_keys)}" if (options.get("create_api_keys") or options.get("api_key_only")) else ""
     if outcome.mfa_secret:
         suffix += "，已绑定 MFA"
+    if outcome.changed_password:
+        suffix += f"，新密码={export_password}"
+    else:
+        suffix += "，未改密（沿用原密码）"
     log(f"账号处理完成：profile {len(exported)} 个{suffix}")
     return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", outcome.changed_password, exported, api_keys, outcome.mfa_secret, final_password=export_password)
 
@@ -1941,7 +1945,9 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
             accounts_pw_path.write_text("\n".join(pw_lines) + "\n", encoding="utf-8")
             accounts_pw_path.chmod(0o600)
             job.accounts_pw_path = str(accounts_pw_path)
-            job.log(f"已生成账号密码提取文件：{len(pw_lines)} 个账号（email:password，可一键下载）")
+            changed_cnt = len([r for r in job.results if r.ok and r.final_password and r.changed_password])
+            kept_cnt = len(pw_lines) - changed_cnt
+            job.log(f"已生成账号密码提取文件：{len(pw_lines)} 个账号（email:password，可一键下载；其中新改密 {changed_cnt} 个，沿用原密码 {kept_cnt} 个）")
         if job.stop_requested:
             job.status = "stopped"
             job.log(f"已中断：成功 {job.ok}，失败/跳过 {job.failed}，导出 {0 if options.get('api_key_only') else len(exported_all)} 条，API Key {len(api_keys_all)} 条（未完成的账号可重新提交）")
