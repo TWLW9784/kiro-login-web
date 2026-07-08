@@ -42,6 +42,21 @@ MFA_MARKERS = (
     "multi-factor", "mfa device", "authenticator app", "verification code",
     "register mfa", "one-time passcode", "security key", "passkey",
 )
+# 「注册/绑定新 MFA」页特有特征：页面会展示二维码 / secret key / 引导扫码或手动录入。
+# 只有出现这些才说明这是首次绑定页、页面上真有 AWS 生成的密钥可抠。
+MFA_REGISTER_MARKERS = (
+    "show secret key", "secret key", "scan the qr", "scan this qr", "qr code",
+    "can't scan", "cannot scan", "enter key manually", "set up authenticator",
+    "register mfa", "add mfa", "register your", "register a new", "assign mfa",
+    "显示密钥", "显示秘钥", "扫描二维码", "设置身份验证", "注册", "绑定新",
+)
+# 「验证已有 MFA」页特有特征：账号已绑过 authenticator，AWS 只让输入 6 位现有验证码，
+# 页面上没有任何可抠的密钥。这类页出现且无预设密钥时应立即失败、明确报错。
+MFA_VERIFY_MARKERS = (
+    "additional verification required", "enter the six digit code",
+    "enter the 6 digit code", "six digit code from your authenticator",
+    "code from your authenticator app", "troubleshoot mfa",
+)
 SUCCESS_MARKERS = (
     "request approved", "approved", "you can close", "added to your devices",
     "you may close", "request was approved",
@@ -559,6 +574,14 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
         # 2) 抠 secret key
         secret = mfa_totp.extract_secret_from_page(page, log)
         if not secret:
+            # 抠不到密钥：区分「注册页渲染慢/DOM 变了」与「其实是已有 MFA 的验证页」。
+            # 若页面带验证页特征且无注册特征，则是已绑定账号，无密钥可抠，交由主循环秒退。
+            try:
+                _b = _body_text(page).lower()
+            except Exception:
+                _b = ""
+            if any(m in _b for m in MFA_VERIFY_MARKERS) and not any(m in _b for m in MFA_REGISTER_MARKERS):
+                log("    MFA: 当前为已有 authenticator 的验证页，无密钥可抠（账号已绑定 MFA）")
             return False, ""
         log(f"    MFA: 获取密钥成功（{secret[:4]}…{secret[-4:]}），本地计算验证码")
         # 立刻完整落盘（不等绑定结果），防止取消/超时导致密钥永久丢失
@@ -698,6 +721,22 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
         #     已抠到密钥的重试直接复用。---
         if any(m in body for m in MFA_MARKERS):
             mfa_attempts += 1
+            # 区分「注册/绑定新 MFA」与「验证已有 MFA」。
+            # 无预设密钥时：若页面是验证页（无注册特征，且带验证页特征），
+            # 说明账号已绑过 authenticator、密钥不在我们手里，抠不出任何密钥。
+            # 直接秒退，报准确错误（且不含风控/验证码关键词，避免误触发换 IP 重试）。
+            if not mfa_secret:
+                has_register = any(m in body for m in MFA_REGISTER_MARKERS)
+                is_verify = any(m in body for m in MFA_VERIFY_MARKERS)
+                if is_verify and not has_register:
+                    log("    MFA: 页面为已有 authenticator 的验证页（非首次绑定），无可抠密钥")
+                    if _shot:
+                        _shot("mfa_already_bound")
+                    return LoginOutcome(
+                        False, changed,
+                        "账号已绑定 MFA，需提供已有 authenticator 密钥（页面无密钥可抓）",
+                        mfa_secret=mfa_secret,
+                    )
             if mfa_attempts > 3:
                 return LoginOutcome(
                     False, changed,
