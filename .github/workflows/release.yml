@@ -111,11 +111,16 @@ jobs:
             3. 首次运行需要本机已安装 Chromium（程序会尝试自动下载）
 
             ## 功能
-            - AWS access portal 批量登录
+            - 两种登录：AWS IAM Identity Center 设备码 / Microsoft 365 组织 SSO
             - MFA 自动绑定与复用
-            - 凭据导出（总 JSON / 拆分 ZIP）
-            - 固定/随机密码模式
-            - 并行登录（默认 10 并发）
+            - 凭据导出（总 JSON / 拆分 ZIP / API Key / MFA / 账号密码）
+            - 固定/随机密码模式、全角符号转半角
+            - 客户空间隔离，登录 O(1) 查找索引（客户数再多也毫秒级）
+            - 代理池（可持久化保存）+ 撞 captcha 自动换 IP
+            - 排队调度、并行登录（默认 2 并发，可调）
+            - 账号数据保留时长可自定义（默认 24 小时，5 分钟 ~ 7 天）
+
+            完整变更见 [CHANGELOG.md](https://github.com/TWLW9784/kiro-login-web/blob/main/CHANGELOG.md)。
           files: artifacts/**/*
           draft: false
           prerelease: false
