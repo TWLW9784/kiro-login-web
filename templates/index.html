@@ -107,7 +107,7 @@
                 <label>首次登录新密码（固定模式使用）</label><input id="newPassword" value="{{ default_new_password }}">
               </div>
               <div class="grid2 compact-fields" style="margin-top:10px">
-                <div><label>并行登录数</label><select id="threads"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option selected>10</option></select><div class="hint">默认 10；撞 captcha 时降到 1~2 并挂代理。</div></div>
+                <div><label>并行登录数</label><select id="threads"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option>10</option></select><div class="hint">默认 2；机房代理下并发越高越容易撞 captcha。挂住宅/移动代理可适当调高。</div></div>
                 <div><label>单账号超时</label><input id="loginTimeout" type="number" min="60" max="600" step="10" value="180"></div>
               </div>
               <div style="margin-top:10px">

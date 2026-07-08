@@ -25,13 +25,30 @@ import urllib.request
 CONTROLLER_URL = (os.environ.get("KIRO_MIHOMO_CONTROLLER", "http://127.0.0.1:9090") or "").rstrip("/")
 SECRET = os.environ.get("KIRO_MIHOMO_SECRET", "") or ""
 GROUP = os.environ.get("KIRO_MIHOMO_GROUP", "KiroLogin") or "KiroLogin"
+# 通过该本地监听口探测“真实出口 IP”（KiroLogin 组绑定在 7895）。用于换节点时确认 IP 真的变了。
+PROBE_PROXY = os.environ.get("KIRO_MIHOMO_PROBE_PROXY", "http://127.0.0.1:7895") or ""
 
 # 切节点是组级全局动作(影响该组所有连接)，用锁串行化，避免并发互相打架。
 _SWITCH_LOCK = threading.Lock()
 # 已知不通的节点(本进程内缓存)，下次挑选时跳过。
 _DEAD_NODES: set[str] = set()
+# 节点 -> 出口IP 缓存（多个节点名常共用同一台 VPS 出口 IP，用它避免“换了节点没换 IP”）。
+_NODE_IP: dict[str, str] = {}
 # 不适合做出口的非真实节点
 _SKIP_KEYWORDS = ("REJECT", "DIRECT", "Reject", "Pass", "Compatible")
+
+
+def exit_ip(timeout: float = 6.0) -> str:
+    """通过 KiroLogin 监听口查当前真实出口 IP；失败返回空串。"""
+    if not PROBE_PROXY:
+        return ""
+    try:
+        proxy_handler = urllib.request.ProxyHandler({"http": PROBE_PROXY, "https": PROBE_PROXY})
+        opener = urllib.request.build_opener(proxy_handler)
+        with opener.open("https://api.ipify.org", timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
 
 
 def enabled() -> bool:
@@ -92,26 +109,46 @@ def switch_node(node: str, group: str = GROUP) -> bool:
 
 def pick_and_switch(group: str = GROUP, exclude: str = "", log=None) -> tuple[str, int | None]:
     """随机挑一个健康节点并切过去，换出口 IP。
+    关键：优先选“出口 IP 与当前不同”的节点（多个节点名常共用同一 VPS IP，
+    光切节点名不换 IP 对解 captcha 无效）。
     返回 (节点名, 延迟ms)；全失败返回 ("", None)。
     串行化(全局锁)，避免并发切换打架。"""
     with _SWITCH_LOCK:
+        cur_ip = exit_ip()
         nodes = [n for n in list_nodes(group) if n not in _DEAD_NODES and n != exclude]
         if not nodes:
             # 死节点缓存可能过期，清空重试一次
             _DEAD_NODES.clear()
             nodes = [n for n in list_nodes(group) if n != exclude]
         random.shuffle(nodes)
-        # 最多探测 8 个，挑第一个通的
-        for node in nodes[:8]:
+        fallback: tuple[str, int | None] | None = None
+        # 最多探测 12 个，挑“通且出口 IP 与当前不同”的
+        for node in nodes[:12]:
             d = node_delay(node)
-            if d is not None:
-                if switch_node(node, group):
-                    if log:
-                        log(f"已切换出口节点 → {node}（延迟 {d}ms，换 IP 规避风控）")
-                    return node, d
-            else:
+            if d is None:
                 _DEAD_NODES.add(node)
-        # 探测都没通，硬切一个(总比不换强)
+                continue
+            if not switch_node(node, group):
+                continue
+            new_ip = exit_ip()
+            # 缓存节点->IP
+            if new_ip:
+                _NODE_IP[node] = new_ip
+            # 出口 IP 确实变了 → 成功
+            if new_ip and new_ip != cur_ip:
+                if log:
+                    log(f"已切换出口节点 → {node}（延迟 {d}ms，出口IP {new_ip}，换 IP 规避风控）")
+                return node, d
+            # 节点通但出口 IP 没变（共用同一 VPS），先记为兵底，继续找不同 IP
+            if fallback is None:
+                fallback = (node, d)
+        # 没找到不同 IP 的，退而用一个“通但同 IP”的节点（总比死节点强）
+        if fallback is not None:
+            switch_node(fallback[0], group)
+            if log:
+                log(f"已切换节点 → {fallback[0]}（未找到不同出口 IP，可能同 VPS）")
+            return fallback
+        # 探测都没通，硬切一个
         if nodes and switch_node(nodes[0], group):
             if log:
                 log(f"已切换出口节点 → {nodes[0]}（未通过探测，强切换 IP）")

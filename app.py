@@ -1810,9 +1810,16 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         log(f"{reason}，立即换 IP 重试（第 {rc_attempt}/{rc_max} 次）")
         if job.stop_event and job.stop_event.is_set():
             break
-        # 换出口 IP(需配了 mihomo 控制器)
+        # 换出口 IP(需配了 mihomo 控制器)；pick_and_switch 会确保出口 IP 真的变了
         if mihomo.enabled():
             mihomo.pick_and_switch(exclude=mihomo.current_node(), log=log)
+            # 撞 captcha 后短暂冷却，避免同一出口连续高频请求被风控叠加
+            if is_captcha_error(outcome.error):
+                cd = random.uniform(3.0, 7.0)
+                slept = 0.0
+                while slept < cd and not (job.stop_event and job.stop_event.is_set()):
+                    time.sleep(min(1.0, cd - slept))
+                    slept += 1.0
         # 重新获取登录 URL(旧 device code 已失效)
         start_rc = dca.register_and_start(
             oidc_region=options["oidc_region"],
