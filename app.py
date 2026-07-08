@@ -20,14 +20,13 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
-from flask import Flask, jsonify, make_response, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import device_code_auth as dca
@@ -513,7 +512,7 @@ def _sweep_orphan_exports(now: float) -> None:
     - job 仍在内存 → 用该 job 的 ttl（尊重自定义长保留，不误删）。
     - job 已被逐出/无法解析 → 回退全局默认 EXPORT_TTL_SECONDS（避免明文密码/MFA 孤儿长期滞留）。"""
     try:
-        base = EXPORT_DIR if 'EXPORT_DIR' in globals() else (Path(__file__).parent / "exports")
+        base = Path(__file__).parent / "exports"
         if not base.exists():
             return
         # 预取内存中各 job 的 ttl，避免在锁外反复取锁。
@@ -1630,7 +1629,6 @@ def load_json_credentials_from_zip(file_storage) -> list[dict[str, str]]:
 
 def run_json_api_key_one(job: Job, row: dict[str, str], label: str) -> AccountResult:
     email = row.get("email") or row.get("profile_arn", "")[-18:]
-    log = lambda m: job.log(f"#{row.get('idx', '?')} {email}: {m}")
     status, token_data = dca.refresh_access_token(
         row["refresh_token"],
         row["client_id"],

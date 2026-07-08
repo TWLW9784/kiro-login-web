@@ -32,9 +32,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-import webbrowser
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urlparse
 

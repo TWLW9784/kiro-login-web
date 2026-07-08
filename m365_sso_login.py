@@ -23,7 +23,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.server
-import io
 import json
 import queue
 import secrets
@@ -36,7 +35,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 # --- 常量（镜像 Kiro IDE / helper） ---
 SOCIAL_SIGNIN_BASE_URL = "https://app.kiro.dev/signin"

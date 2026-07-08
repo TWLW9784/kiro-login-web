@@ -141,7 +141,6 @@ def drive_m365_login(
                 body = page.inner_text("body", timeout=3000).lower()
             except Exception:
                 body = ""
-            host = url.split("/")[2] if "://" in url else ""
 
             # M365 密码页
             if not pwd_done and ("enter password" in body or "输入密码" in body
