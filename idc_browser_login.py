@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -60,6 +61,19 @@ MFA_VERIFY_MARKERS = (
 SUCCESS_MARKERS = (
     "request approved", "approved", "you can close", "added to your devices",
     "you may close", "request was approved",
+)
+
+# 微软联邦登录（Entra ID / Microsoft 365）相关。部分 AWS IDC 实例把身份
+# 验证联邦给微软：设备码流程打开 start_url 后会重定向到 login.microsoftonline.com。
+# 这时 AWS 原生 DOM（#awsui-input-*）对不上，需走微软的邮箱→密码→MFA 流程。
+MS_LOGIN_HOSTS = (
+    "login.microsoftonline.com", "login.microsoftonline.us", "login.partner.microsoftonline.cn",
+    "login.live.com", "login.microsoft.com", "microsoftonline.com",
+)
+MS_PWD_ERROR_MARKERS = (
+    "your account or password is incorrect", "incorrect password",
+    "密码不正确", "couldn't find your account", "didn't recognize",
+    "that microsoft account doesn't exist",
 )
 
 
@@ -130,14 +144,25 @@ def _read_txt(p: Path) -> List[AccountRow]:
         if len(parts) < 2:
             parts = line.split(":", 2)  # email:pass[:proxy] (email khong chua ':')
         parts = [x.strip() for x in parts]
-        email = parts[0] if parts else ""
-        pw = parts[1] if len(parts) > 1 else ""
+        
+        # 识别 8 段管道格式（AWS IdC 导出）：
+        # login_url | username | email | user_id | password | reset_at | status | error
+        # AWS IdC 登录用 username（不带 @），不是 email
+        if len(parts) >= 8 and ('awsapps.com' in parts[0] or 'amazonaws.com' in parts[0]):
+            email = parts[1]  # username（AWS IdC 用 username 登录，不是 email）
+            pw = parts[4]     # password
+            proxy = ""        # 8 段格式不含 proxy
+        else:
+            # 原有格式：email|password|proxy 或 email:password:proxy
+            email = parts[0] if parts else ""
+            pw = parts[1] if len(parts) > 1 else ""
+            proxy = parts[2] if len(parts) > 2 else ""
+        
         # chap nhan username thuan (khong can @); can co password de tranh dong rac
         if not email or not pw:
             continue
         if email.lower() in ("email", "username", "user", "account"):
             continue
-        proxy = parts[2] if len(parts) > 2 else ""
         out.append(AccountRow(idx=i, email=email, password=pw, proxy=proxy, kind="txt"))
     return out
 
@@ -398,11 +423,16 @@ def drive_login(
     debug_dir: str = "",
     mfa_secret: str = "",
     on_secret=None,
+    on_password_changed=None,
 ) -> LoginOutcome:
     """Mo Chromium sach, tu login trang device-code den khi bam 'Allow access'.
 
     on_secret(secret): 抠到 AWS 新生成的 MFA 密钥的瞬间立刻回调（完整、不脱敏），
     供上层立刻落盘，避免中途取消/超时导致密钥永久丢失。
+    on_password_changed(new_pw): 微软/AWS 首次登录改密**提交成功的瞬间**立刻回调，
+    供上层立刻落盘。防止改密后 Stay-signed-in/跳回 AWS/取 token 任一步超时或抛异常
+    导致新密码永久丢失（历史 bug：落盘只在 drive_login 正常返回后靠 outcome.changed_password
+    触发，改密后超时/异常返回会丢掉新密码 → 死号）。
     """
     launch_args = [
         "--disable-blink-features=AutomationControlled",
@@ -445,7 +475,8 @@ def drive_login(
         try:
             return _flow(page, verification_uri_complete, email, password,
                          new_password, log, stop_event, timeout_s, debug_dir,
-                         known_mfa_secret=mfa_secret, on_secret=on_secret)
+                         known_mfa_secret=mfa_secret, on_secret=on_secret,
+                         on_password_changed=on_password_changed)
         except Exception as e:
             return LoginOutcome(False, error=f"loi browser: {e}")
         finally:
@@ -666,8 +697,301 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
     return False, secret
 
 
+def _on_ms_login(page) -> bool:
+    """当前页是否已重定向到微软登录（Entra/M365）。"""
+    try:
+        host = (urlparse(page.url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) or host.endswith(h) for h in MS_LOGIN_HOSTS)
+
+
+def _handle_ms_federated(page, email, password, log, _shot, stop_event,
+                         mfa_secret: str = "", deadline: float = 0.0,
+                         new_password: str = "", on_password_changed=None) -> tuple[str, str, bool]:
+    """处理 AWS IDC 联邦到微软（Entra ID / Microsoft 365）的登录页。
+
+    微软页 DOM 与 AWS 原生页完全不同，这里复用 m365 驱动的 selector：
+      邮箱页（loginfmt/type=email）→ Next → 密码页（passwd）→ Sign in
+      → [可选 首次登录改密 Update your password] → [可选 MFA] → Stay signed in? → Yes
+    处理完会自动跳回 AWS 同意页（Allow access），交回主循环继续。
+
+    返回 (status, detail, changed_password)：
+      'left'  = 已离开微软页（跳回 AWS 或 success），交回主循环
+      'error' = 硬错误（密码错/需 MFA 但无密钥等），detail 为原因
+      'timeout' = 本阶段超时
+    changed_password：本次是否在微软页成功改密（改密后新密码=new_password）。
+    """
+    mfa_norm = mfa_totp.normalize_secret(mfa_secret) if mfa_secret else ""
+    if deadline <= 0:
+        deadline = time.time() + 120
+    log("    检测到联邦至微软登录页（Entra/M365），切换微软 DOM 流程")
+    _shot("ms_login")
+    changed_pw = False
+    # 状态驱动：不用 sticky 的 email_done/pwd_done 锁（历史 bug：Next 未真正推进时
+    # _pw_ready() 被预渲染的隐藏密码框骗出 false-positive → 往无效框填密码并焊死 pwd_done
+    # → 页面仍在邮箱页 → 所有分支不匹配 → 空转到超时）。改为每轮按当前真实页面状态决策，
+    # 配合各步尝试次数上限 + 未识别页面心跳日志/截图，杜绝黑盒死等。
+    email_attempts = 0
+    pwd_attempts = 0
+    change_pw_attempts = 0
+    mfa_attempts = 0
+    last_url = ""
+    idle = 0
+    last_hb = 0.0
+
+    def _pw_ready() -> bool:
+        # 微软邮箱→密码有导航，passwd 框真正可交互（可见+有尺寸+未禁用）才算到位
+        try:
+            return page.evaluate(
+                "()=>{const el=document.querySelector('input[name=passwd]');"
+                "if(!el)return false;const cs=getComputedStyle(el);"
+                "const r=el.getBoundingClientRect();"
+                "return cs.display!=='none'&&cs.visibility!=='hidden'&&r.height>0"
+                "&&!el.disabled&&!el.readOnly;}")
+        except Exception:
+            return False
+
+    def _email_ready() -> bool:
+        # 邮箱框真正可交互（可见+有尺寸+未禁用）才算还停在账号输入页
+        try:
+            return page.evaluate(
+                "()=>{const el=document.querySelector('input[type=email],input[name=loginfmt],input[name=email]');"
+                "if(!el)return false;const cs=getComputedStyle(el);"
+                "const r=el.getBoundingClientRect();"
+                "return cs.display!=='none'&&cs.visibility!=='hidden'&&r.height>0"
+                "&&!el.disabled&&!el.readOnly;}")
+        except Exception:
+            return False
+
+    def _advanced_from_email(timeout: float = 14.0) -> bool:
+        # 填完邮箱点 Next 后，确认页面真的推进：密码框就绪 / 出现账号错误 / 离开微软登录域
+        # 历史抑制阵——不能因为 `not _email_ready()` 就秒返 True，邮箱框在导航中会瞬时消失，
+        # 一旦重新出现又会被主循环误判回到邮箱分支 → 一直重填邮箱、却向已推进的密码页提交空密码。
+        end = time.time() + timeout
+        while time.time() < end:
+            time.sleep(0.5)
+            if _pw_ready():
+                return True
+            try:
+                b = page.inner_text("body", timeout=1500).lower()
+            except Exception:
+                b = ""
+            if any(k in b for k in MS_PWD_ERROR_MARKERS):
+                return True
+            if not _on_ms_login(page):
+                return True
+        return False
+
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return "error", "已中断", changed_pw
+        # 已离开微软页 = 跳回 AWS（同意页/success），交回主循环
+        if not _on_ms_login(page):
+            log("    微软登录完成，已跳回 AWS，交回主循环处理同意页")
+            _shot("ms_left_to_aws")
+            return "left", "", changed_pw
+        try:
+            body = page.inner_text("body", timeout=3000).lower()
+        except Exception:
+            body = ""
+
+        # 1) 首次登录/密码过期：Update your password（current + new + confirm 三框）——最具体，先判
+        cur_box = page.locator("input[name=currentpasswd], #currentPassword").first
+        new_box = page.locator("input[name=newpasswd], #newPassword").first
+        if (("update your password" in body or "更新密码" in body
+                or (cur_box.count() and new_box.count()))
+                and cur_box.count() and new_box.count()):
+            change_pw_attempts += 1
+            if change_pw_attempts > 3:
+                _shot("ms_change_pw_stuck")
+                detail = _visible_error_text(page)
+                return "error", f"微软首次登录改密多次未通过（{detail or '密码策略不符/页面未推进'}）", changed_pw
+            eff_new = new_password or password
+            try:
+                cur_box.fill(password)
+                new_box.fill(eff_new)
+                page.locator("input[name=confirmnewpasswd], #confirmNewPassword").first.fill(eff_new)
+                log(f"    微软首次登录改密：已填入当前/新/确认密码（新密码={eff_new}）")
+                _shot("ms_update_pw")
+                _click_ms(page, ['#idSIButton9', 'input[type=submit]',
+                                 'button[type=submit]', 'button:has-text("Sign in")'])
+                if eff_new != password:
+                    changed_pw = True
+                    # 改密提交成功的瞬间立刻落盘（微软联邦改密路径），防止后续
+                    # Stay-signed-in/跳回 AWS/取 token 超时或异常丢新密码 → 死号。
+                    if on_password_changed and eff_new:
+                        try:
+                            on_password_changed(eff_new)
+                        except Exception:
+                            pass
+                time.sleep(3.0)
+                continue
+            except Exception:
+                time.sleep(1.0)
+                continue
+
+        # 2) 密码错 / 账号不存在
+        if any(k in body for k in MS_PWD_ERROR_MARKERS):
+            _shot("ms_pwd_error")
+            detail = _visible_error_text(page)
+            return "error", f"微软账号或密码错误（{detail or 'account or password incorrect'}）", changed_pw
+
+        # 3) MFA：需 TOTP 密钥才能自动
+        if any(k in body for k in ("verification code", "enter code", "authenticator",
+                                   "verify your identity", "输入验证码", "one-time",
+                                   "approve sign in", "身份验证")):
+            mfa_attempts += 1
+            if mfa_attempts > 4:
+                return "error", "微软 MFA 验证多次失败", changed_pw
+            if mfa_norm:
+                code = mfa_totp.totp_now(mfa_norm)
+                code_box = page.locator("input[type=tel], input[name=otc], "
+                                        "input[autocomplete='one-time-code'], input[type=text]").first
+                if code_box.count() and code_box.is_visible():
+                    try:
+                        code_box.fill(code)
+                        _click_ms(page, ['#idSubmit_SAOTCC_Continue', '#idSIButton9',
+                                         'input[type=submit]', 'button:has-text("Verify")',
+                                         'button:has-text("Next")'])
+                        log(f"    已填入微软 MFA 验证码（第 {mfa_attempts} 次）")
+                        _shot(f"ms_mfa_{mfa_attempts}")
+                        time.sleep(3.0)
+                        continue
+                    except Exception:
+                        pass
+            else:
+                _shot("ms_mfa_no_secret")
+                return "error", "该账号联邦微软且要求 MFA，但未提供 TOTP 密钥（暂不支持自动绑定微软 authenticator）", changed_pw
+
+        # 4) Stay signed in?
+        if "stay signed in" in body or "保持登录" in body or "reduce the number of times" in body:
+            _click_ms(page, ['#idSIButton9', 'button:has-text("Yes")',
+                             'input[type=submit][value="Yes"]'])
+            log("    Stay signed in → Yes")
+            time.sleep(2.5)
+            continue
+
+        # 5) More information required / 跳过类提示
+        if "more information" in body or "需要更多信息" in body:
+            if not _click_ms(page, ['a:has-text("Skip")', 'button:has-text("Skip")',
+                                    'input[value="Skip setup"]', '#idBtn_Back']):
+                _click_ms(page, ['#idSIButton9', 'input[type=submit]'])
+            time.sleep(2.5)
+            continue
+
+        # 6) 密码页：passwd 框真正可交互，且【已不在邮箱页】。
+        #    加 not _email_ready() 守卫：堵住邮箱页预渲染隐藏密码框的 false-positive
+        #    （历史死锁根因——Next 没推进却误填密码）。
+        if _pw_ready() and not _email_ready():
+            pwd_attempts += 1
+            if pwd_attempts > 4:
+                _shot("ms_pwd_stuck")
+                return "error", "微软密码页多次提交未推进（密码错或页面加载慢）", changed_pw
+            pw = page.locator("input[type=password], input[name=passwd]").first
+            try:
+                pw.fill(password)
+                # 回读确认真的填进去了（避免向密码页提交空密码 → "Please enter your password."）
+                try:
+                    filled_val = pw.input_value()
+                except Exception:
+                    filled_val = ""
+                if not filled_val:
+                    log("    微软密码填入后回读为空，重试填入")
+                    time.sleep(0.5)
+                    try:
+                        pw.click()
+                    except Exception:
+                        pass
+                    pw.type(password, delay=30)
+                    try:
+                        filled_val = pw.input_value()
+                    except Exception:
+                        filled_val = ""
+                if not filled_val:
+                    _shot("ms_pwd_fill_empty")
+                    time.sleep(1.0)
+                    continue
+                log("    已填入微软密码")
+                _shot("ms_pwd_filled")
+                _click_ms(page, ['#idSIButton9', 'input[type=submit]',
+                                 'button[type=submit]', 'button:has-text("Sign in")',
+                                 'button:has-text("登录")'])
+                # 确认离开密码页（就绪消失）或出现错误，否则下一轮受 pwd_attempts 限制重试
+                end = time.time() + 10.0
+                while time.time() < end:
+                    time.sleep(0.5)
+                    if not _pw_ready():
+                        break
+                    try:
+                        b2 = page.inner_text("body", timeout=1500).lower()
+                    except Exception:
+                        b2 = ""
+                    if any(k in b2 for k in MS_PWD_ERROR_MARKERS):
+                        break
+                continue
+            except Exception:
+                time.sleep(1.0)
+                continue
+
+        # 7) 邮箱页：账号框可交互就填 + Next，并【验证真的推进】，没推进则重试（有上限）
+        if _email_ready():
+            email_attempts += 1
+            if email_attempts > 4:
+                _shot("ms_email_stuck")
+                return "error", "微软邮箱页多次提交未推进（Next 未生效或页面加载慢）", changed_pw
+            email_box = page.locator("input[type=email], input[name=loginfmt], input[name=email]").first
+            try:
+                email_box.fill(email)
+                log(f"    已填入微软邮箱/账号（第 {email_attempts} 次）")
+                _shot("ms_email_filled")
+                _click_ms(page, ['#idSIButton9', 'input[type=submit]',
+                                 'button[type=submit]', 'button:has-text("Next")',
+                                 'button:has-text("下一步")'])
+                if not _advanced_from_email():
+                    log("    微软邮箱提交后页面未推进（Next 可能未生效），将重试")
+                    _shot("ms_email_no_advance")
+                continue
+            except Exception:
+                time.sleep(1.0)
+                continue
+
+        # 8) 未识别页面兜底：心跳日志 + 截图（每 12s 一次），杜绝黑盒；同 URL 停滞尝试通用前进
+        url = page.url
+        idle = idle + 1 if url == last_url else 0
+        last_url = url
+        now = time.time()
+        if now - last_hb > 12:
+            title = ""
+            try:
+                title = page.title()
+            except Exception:
+                pass
+            log(f"    微软页等待中（未识别状态）：title={title!r} url={url[:90]}")
+            _shot("ms_unknown")
+            last_hb = now
+        if idle >= 2:
+            _click_ms(page, ['#idSIButton9', 'button[type=submit]', 'input[type=submit]',
+                             'button:has-text("Next")', 'button:has-text("Continue")'])
+        time.sleep(1.5)
+    return "timeout", "微软登录阶段超时", changed_pw
+
+
+def _click_ms(page, selectors) -> bool:
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() and el.is_visible():
+                el.click(timeout=2500)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
-          debug_dir: str = "", known_mfa_secret: str = "", on_secret=None) -> LoginOutcome:
+          debug_dir: str = "", known_mfa_secret: str = "", on_secret=None,
+          on_password_changed=None) -> LoginOutcome:
     safe = "".join(c if c.isalnum() else "_" for c in (email or "acc"))[:20]
     shot = {"i": 0}
 
@@ -714,6 +1038,27 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
 
         _maybe_cookie_accept(page, log)
         body = _body_text(page).lower()
+
+        # --- 联邦至微软（Entra/M365）：部分 AWS IDC 实例把身份验证交给微软。
+        #     微软页 DOM 与 AWS 原生页完全不同，必须先于 AWS 分支检测并切换流程。---
+        if _on_ms_login(page):
+            seen_password = True  # 已进入联邦登录，防止回到 username 分支误判
+            st_ms, detail_ms, changed_ms = _handle_ms_federated(
+                page, email, password, log, _shot, stop_event,
+                mfa_secret=mfa_secret, deadline=deadline, new_password=new_password,
+                on_password_changed=on_password_changed,
+            )
+            if changed_ms:
+                changed = True
+            if st_ms == "left":
+                # 已跳回 AWS（同意页/success），交回主循环继续处理 Allow access
+                idle_rounds = 0
+                time.sleep(0.8)
+                continue
+            if st_ms == "error":
+                return LoginOutcome(False, changed, detail_ms, mfa_secret=mfa_secret)
+            # timeout：回主循环（可能已接近总超时）
+            continue
 
         # --- MFA 绑定：新账号首次被要求绑定 authenticator。
         #     自动抠密钥 + 本地算 TOTP 填入完成绑定，并保存密钥。
@@ -782,7 +1127,7 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
         # --- DOI MAT KHAU lan dau: >=2 o password ---
         if pw_n >= 2:
             change_pw_attempts += 1
-            log("    form DOI MAT KHAU lan dau -> dat password moi")
+            log(f"    form DOI MAT KHAU lan dau -> dat password moi（新密码={new_password}）")
             if change_pw_attempts > 3:
                 detail = _visible_error_text(page)
                 return LoginOutcome(
@@ -812,8 +1157,13 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                 except Exception:
                     pass
             changed = True
+            # 改密提交成功的瞬间立刻落盘（AWS 原生首次改密路径），防止后续步骤超时/异常丢新密码。
+            if on_password_changed and new_password:
+                try:
+                    on_password_changed(new_password)
+                except Exception:
+                    pass
             idle_rounds = 0
-
             end = time.time() + 8.0
             while time.time() < end:
                 body_after = _body_text(page).lower()

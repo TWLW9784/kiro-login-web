@@ -566,6 +566,8 @@ def account_input_to_dict(account: "AccountInput") -> dict[str, str | int]:
         "password": account.password,
         "proxy": account.proxy,
         "mfaSecret": account.mfa_secret,
+        "startUrl": account.start_url,
+        "region": account.region,
     }
 
 
@@ -576,6 +578,8 @@ def account_input_from_dict(item: dict[str, Any], fallback_idx: int) -> "Account
         password=str(item.get("password") or ""),
         proxy=str(item.get("proxy") or ""),
         mfa_secret=str(item.get("mfaSecret") or item.get("mfa_secret") or ""),
+        start_url=str(item.get("startUrl") or item.get("start_url") or ""),
+        region=str(item.get("region") or ""),
     )
 
 
@@ -826,6 +830,10 @@ def simplify_job_message(message: str) -> str | None:
         return None
     for old, new in replacements:
         msg = msg.replace(old, new)
+    # 含明文密码的日志行（改密/落盘）：只做关键词翻译，跳过后续字符清洗
+    #（replace("...","") 与空白折叠会破坏含特殊字符的密码），保证日志中密码与落盘完全一致、不脱敏。
+    if ("新密码=" in msg) or ("新密码已立刻落盘" in msg):
+        return msg.strip()
     msg = msg.replace("(clean, no cache)", "")
     msg = msg.replace("...", "")
     msg = msg.replace("lan ", "第")
@@ -840,6 +848,8 @@ class AccountInput:
     password: str
     proxy: str = ""
     mfa_secret: str = ""   # 已绑定 MFA 的账号需要提供 TOTP 密钥（base32）
+    start_url: str = ""    # 每账号独立的 IDC Start URL（管道式格式）；空则回退全局
+    region: str = ""       # 每账号独立的 region（同时作 oidc/kiro region）；空则回退全局
 
 
 @dataclass
@@ -1055,6 +1065,130 @@ def _parse_fixed_columns(text: str) -> list[AccountInput]:
     return accounts
 
 
+def _parse_pipe_starturl_blocks(text: str) -> list[AccountInput]:
+    """解析管道分隔、每行自带 start_url 的格式。
+
+    支持两类：
+
+    1) 旧管道格式：
+       start_url | region | username | password | plan_name
+
+    2) AWS IdC 账号导出 8 列格式：
+       login_url | username | email | user_id | password | reset_at | status | error
+
+       这种格式是 AWS 原生 IdC 登录，登录账号必须使用 username 字段（第 2 段），
+       不是 email 字段（第 3 段）。email 只作来源信息，不参与登录。
+
+    账号字段仍沿用 AccountInput.email，实际可为 AWS username。
+    """
+    accounts: list[AccountInput] = []
+    region_re = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        start_url = parts[0] if parts else ""
+        # 识别阀：第一段必须是 https 的 awsapps/portal URL
+        low = start_url.lower()
+        if not (low.startswith("https://") and (".awsapps.com" in low or ".portal." in low)):
+            continue
+
+        username = ""
+        password = ""
+        region = ""
+        mfa_secret = ""
+
+        # 新格式：login_url | username | email | user_id | password | reset_at | status | error
+        # 第 2 段不是 region，且第 3 段通常是 email，第 5 段是 password。
+        if len(parts) >= 8 and not region_re.match(parts[1].lower()) and len(parts) >= 5:
+            username = parts[1]
+            password = parts[4]
+            # 可选兼容：若有人在 password 后额外塞入已绑定 MFA 密钥，自动识别。
+            # 原始第 6 段 reset_at 是 ISO 时间，不会被误判为 base32。
+            if len(parts) >= 6 and _looks_like_mfa_secret(parts[5]):
+                mfa_secret = re.sub(r"[\s-]", "", parts[5]).upper()
+        else:
+            # 旧格式：start_url | region | username | password | plan_name
+            # 密码可能含 '|': 首 3 段固定，末尾 plan_name 从右切。
+            _start, _sep, rest = line.partition("|")
+            region, _, rest2 = rest.partition("|")
+            username, _, rest3 = rest2.partition("|")
+            password, sep, _plan = rest3.rpartition("|")
+            if not sep:
+                # 只有 4 段（无 plan_name）：rest3 整个就是密码
+                password = rest3
+            region = region.strip()
+
+        username = username.strip()
+        password = password.strip()
+        if not username or not password:
+            continue
+        accounts.append(AccountInput(
+            idx=len(accounts) + 1,
+            email=username,
+            password=password,
+            mfa_secret=mfa_secret,
+            start_url=start_url,
+            region=region,
+        ))
+    return accounts
+
+
+def _parse_starturl_header_blocks(text: str) -> list[AccountInput]:
+    """解析「表头块」格式：单独一行 start_url、（可选）单独一行 region，然后多行 email|password 账号。
+
+      https://qweqwie.awsapps.com/start
+      eu-north-1
+      kiroxin_vip69@vccccc.kceui.fun|l$Y9{qD2odI73UqK
+      kiroxin_vip70@vccccc.kceui.fun|another$Pass
+
+    特点：
+    - 表头行：以 https:// 开头、host 为 *.awsapps.com 或 *.portal.*、且**不含 `|`**（区分单行管道格式）。
+      遇到新表头行就切换当前 start_url、重置 region。
+    - region 行：形如 us-east-1 / eu-north-1 的裸 region（紧跟表头行）。
+    - 账号行：`email|password`，email 不含 `|`，故以首个 `|` 左切，剩余全为 password（密码含 `|` 也安全）。
+    支持多个表头块（不同 start_url/region 分段）。
+    """
+    region_re = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+    accounts: list[AccountInput] = []
+    cur_url = ""
+    cur_region = ""
+    saw_header = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        low = line.lower()
+        # 表头 URL 行（无管道）
+        if "|" not in line and low.startswith("https://") and (".awsapps.com" in low or ".portal." in low):
+            cur_url = line
+            cur_region = ""
+            saw_header = True
+            continue
+        # region 行（紧跟表头、尚未设区）
+        if cur_url and not cur_region and "|" not in line and region_re.match(low):
+            cur_region = line
+            continue
+        # 账号行：email|password
+        if cur_url and "|" in line:
+            email, _, password = line.partition("|")
+            email = email.strip()
+            password = password.strip()
+            if email and password:
+                accounts.append(AccountInput(
+                    idx=len(accounts) + 1,
+                    email=email,
+                    password=password,
+                    start_url=cur_url,
+                    region=cur_region,
+                ))
+            continue
+    return accounts if saw_header else []
+
+
 def parse_accounts(text: str, mode: str = "auto") -> list[AccountInput]:
     """解析账号输入。支持格式（分隔符可用空格/tab/逗号/分号/竖线/冒号）：
       email password                       # 最简
@@ -1069,6 +1203,17 @@ def parse_accounts(text: str, mode: str = "auto") -> list[AccountInput]:
     """
     if mode == "fixed":
         return _parse_fixed_columns(text)
+
+    # 最优先：管道分隔、每行自带 start_url|region|username|password|plan 的格式
+    # （第一段是 https awsapps/portal URL，识别性强、无歧义）
+    pipe_blocks = _parse_pipe_starturl_blocks(text)
+    if pipe_blocks:
+        return pipe_blocks
+
+    # 次优先：表头块格式（单行 start_url + 单行 region + 多行 email|password）
+    header_blocks = _parse_starturl_header_blocks(text)
+    if header_blocks:
+        return header_blocks
 
     # 优先：mmostore login=/onetime password= 块格式
     login_blocks = _parse_login_onetime_blocks(text)
@@ -1864,10 +2009,16 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             log(f"新密码落盘失败：{exc}")
 
     log("开始登录")
+    # 每账号可自带 start_url + region（管道式格式）；缺省时回退到全局选项。
+    eff_start_url = acc.start_url or options["start_url"]
+    eff_oidc_region = dca.normalize_oidc_region(acc.region) if acc.region else options["oidc_region"]
+    eff_kiro_region = dca.normalize_kiro_region(acc.region) if acc.region else options["kiro_region"]
+    if acc.start_url:
+        log(f"用账号自带 Start URL/Region：{eff_start_url}（region={eff_kiro_region}）")
     start = dca.register_and_start(
-        oidc_region=options["oidc_region"],
-        kiro_region=options["kiro_region"],
-        start_url=options["start_url"],
+        oidc_region=eff_oidc_region,
+        kiro_region=eff_kiro_region,
+        start_url=eff_start_url,
         log=log,
     )
     if not start.ok:
@@ -1893,6 +2044,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             stop_event=job.stop_event,
             mfa_secret=acc.mfa_secret,
             on_secret=_save_mfa_early,
+            on_password_changed=_save_password_early,
         )
 
     outcome = _drive_once(start.verification_uri_complete, new_password)
@@ -1962,9 +2114,9 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             break
         # 重新获取登录 URL(旧 device code 已失效)
         start_rc = dca.register_and_start(
-            oidc_region=options["oidc_region"],
-            kiro_region=options["kiro_region"],
-            start_url=options["start_url"],
+            oidc_region=eff_oidc_region,
+            kiro_region=eff_kiro_region,
+            start_url=eff_start_url,
             log=log,
         )
         if not start_rc.ok:
@@ -1983,9 +2135,9 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         retry_password = stronger_account_password()
         log("首次改密密码策略不通过，自动生成更强新密码并重试一次")
         start_retry = dca.register_and_start(
-            oidc_region=options["oidc_region"],
-            kiro_region=options["kiro_region"],
-            start_url=options["start_url"],
+            oidc_region=eff_oidc_region,
+            kiro_region=eff_kiro_region,
+            start_url=eff_start_url,
             log=log,
         )
         if not start_retry.ok:
@@ -2016,7 +2168,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     exp.email = acc.email
 
     log("token 获取成功，开始扫描 profileArn")
-    profiles = list_profiles_all_regions(exp.access_token, options["kiro_region"], log, options.get("scan_all_regions", False))
+    profiles = list_profiles_all_regions(exp.access_token, eff_kiro_region, log, options.get("scan_all_regions", False))
     if not profiles:
         log("未获取到 profileArn")
         return AccountResult(
@@ -2446,6 +2598,9 @@ def create_job():
     if login_mode == "m365":
         # M365/外部 IdP 不需要 start_url（门户做 home realm discovery）
         start_url_or_error = ""
+    elif accounts and all(acc.start_url for acc in accounts):
+        # 管道式格式：每账号自带 start_url，无需全局 start_url（逐账号已内含）
+        start_url_or_error = (payload.get("startUrl") or "").strip()
     else:
         raw_start_url = (payload.get("startUrl") or "").strip() or extract_start_url_from_accounts_text(raw_accounts_text)
         ok_start_url, start_url_or_error = validate_start_url(raw_start_url)
