@@ -1106,10 +1106,12 @@ def _parse_pipe_starturl_blocks(text: str) -> list[AccountInput]:
         if len(parts) >= 8 and not region_re.match(parts[1].lower()) and len(parts) >= 5:
             username = parts[1]
             password = parts[4]
-            # 可选兼容：若有人在 password 后额外塞入已绑定 MFA 密钥，自动识别。
-            # 原始第 6 段 reset_at 是 ISO 时间，不会被误判为 base32。
-            if len(parts) >= 6 and _looks_like_mfa_secret(parts[5]):
-                mfa_secret = re.sub(r"[\s-]", "", parts[5]).upper()
+            # 可选兼容：若有人在 password 后任意位置额外塞入已绑定 MFA 密钥，自动识别。
+            # 原始 reset_at/status/error 不会被误判为 base32。
+            for cand in parts[5:]:
+                if _looks_like_mfa_secret(cand):
+                    mfa_secret = re.sub(r"[\s-]", "", cand).upper()
+                    break
         else:
             # 旧格式：start_url | region | username | password | plan_name
             # 密码可能含 '|': 首 3 段固定，末尾 plan_name 从右切。
