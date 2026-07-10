@@ -1156,13 +1156,6 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                     page.keyboard.press("Enter")
                 except Exception:
                     pass
-            changed = True
-            # 改密提交成功的瞬间立刻落盘（AWS 原生首次改密路径），防止后续步骤超时/异常丢新密码。
-            if on_password_changed and new_password:
-                try:
-                    on_password_changed(new_password)
-                except Exception:
-                    pass
             idle_rounds = 0
             end = time.time() + 8.0
             while time.time() < end:
@@ -1183,6 +1176,16 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                 detail = _visible_error_text(page)
                 log(f"    首次登录改密码未通过（{detail or '仍停留在改密码页'}）")
                 continue
+
+            changed = True
+            # 必须确认 AWS 已接受新密码（离开改密页/出现授权页）后再落盘。
+            # 旧逻辑在点击按钮后立即保存，遇到密码策略不通过时会把失败的弱密码写入，
+            # 后续强密码重试又因 saved 标记无法覆盖，造成“强密码未保存”。
+            if on_password_changed and new_password:
+                try:
+                    on_password_changed(new_password)
+                except Exception:
+                    pass
             time.sleep(0.5)
             continue
 
