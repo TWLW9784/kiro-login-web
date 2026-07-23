@@ -990,10 +990,20 @@ def extract_start_url_from_accounts_text(text: str) -> str:
             continue
         key = re.sub(r"\s+", " ", match.group(1).strip().lower())
         value = match.group(2).strip()
-        if key.startswith("default aws access portal url") and value.startswith(("http://", "https://")):
-            default_url = value
-        elif key.startswith("dual-stack aws access portal url") and value.startswith(("http://", "https://")):
-            dual_stack_url = value
+        if not value.startswith(("http://", "https://")):
+            continue
+        low_val = value.lower()
+        # 优先用值本身判断（兼容中英文标签）：awsapps.com 为 IPv4 首选，
+        # portal.<region>.app.aws 为双栈兜底。同时保留英文标签识别。
+        if ".awsapps.com" in low_val or key.startswith("default aws access portal url"):
+            if not default_url:
+                default_url = value
+        elif ".portal." in low_val and low_val.endswith(".app.aws"):
+            if not dual_stack_url:
+                dual_stack_url = value
+        elif key.startswith("dual-stack aws access portal url"):
+            if not dual_stack_url:
+                dual_stack_url = value
     return default_url or dual_stack_url
 
 
@@ -1074,6 +1084,7 @@ def _parse_pipe_starturl_blocks(text: str) -> list[AccountInput]:
 
     1) 旧管道格式：
        start_url | region | username | password | plan_name
+       或逗号分隔：start_url,region,username,password,plan_name
 
     2) AWS IdC 账号导出 8 列格式：
        login_url | username | email | user_id | password | reset_at | status | error
@@ -1082,6 +1093,8 @@ def _parse_pipe_starturl_blocks(text: str) -> list[AccountInput]:
        不是 email 字段（第 3 段）。email 只作来源信息，不参与登录。
 
     账号字段仍沿用 AccountInput.email，实际可为 AWS username。
+    分隔符支持 | 和 ,。若一行同时包含两者，以逗号为字段分隔符；
+    末尾的 CONTEXT_AWARE| 等标记不应让解析器误判为管道格式。
     """
     accounts: list[AccountInput] = []
     region_re = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
@@ -1089,9 +1102,15 @@ def _parse_pipe_starturl_blocks(text: str) -> list[AccountInput]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if "|" not in line:
+        # 逗号导出格式的末尾可能是 CONTEXT_AWARE|，所以一行同时含逗号和
+        # 竖线时必须优先逗号；否则会把整行误判成只有一个字段的管道格式。
+        if "," in line:
+            sep = ","
+        elif "|" in line:
+            sep = "|"
+        else:
             continue
-        parts = [p.strip() for p in line.split("|")]
+        parts = [p.strip() for p in line.split(sep)]
         start_url = parts[0] if parts else ""
         # 识别阀：第一段必须是 https 的 awsapps/portal URL
         low = start_url.lower()
@@ -1115,14 +1134,17 @@ def _parse_pipe_starturl_blocks(text: str) -> list[AccountInput]:
                     mfa_secret = re.sub(r"[\s-]", "", cand).upper()
                     break
         else:
-            # 旧格式：start_url | region | username | password | plan_name
-            # 密码可能含 '|': 首 3 段固定，末尾 plan_name 从右切。
-            _start, _sep, rest = line.partition("|")
-            region, _, rest2 = rest.partition("|")
-            username, _, rest3 = rest2.partition("|")
-            password, sep, _plan = rest3.rpartition("|")
-            if not sep:
-                # 只有 4 段（无 plan_name）：rest3 整个就是密码
+            # 旧格式：start_url sep region sep username sep password [sep plan_name]
+            # 密码可能含分隔符: 首 3 段固定，末尾 plan_name 从右切。
+            # 但如果只有 4 段，按 start_url,region,username,password 顺序切分。
+            _start, _sep, rest = line.partition(sep)
+            region, _, rest2 = rest.partition(sep)
+            username, _, rest3 = rest2.partition(sep)
+            # rest3 可能是 "password" 或 "password sep plan_name"
+            # 如果 rest3 中还有分隔符，用 rpartition 从右切出 plan_name；否则整个是密码
+            if sep in rest3:
+                password, s, _plan = rest3.rpartition(sep)
+            else:
                 password = rest3
             region = region.strip()
 
@@ -1202,7 +1224,8 @@ LABELED_FIELD_ALIASES = {
     "mfa_secret": ("mfa", "2fa", "totp", "密钥", "mfa密钥", "验证器密钥"),
 }
 # 标签行正则：行首为中/英文标签 + 冒号（半/全角）+ 值。
-_LABELED_LINE_RE = re.compile(r"^\s*([A-Za-z\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff ]*?)\s*[:\uff1a]\s*(.+?)\s*$")
+# 标签允许含空格、连字符、半/全角括号（如「默认 AWS access portal URL（仅限 IPv4）」「 Dual-stack ...」）。
+_LABELED_LINE_RE = re.compile(r"^\s*([A-Za-z\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff ()\uff08\uff09\-]*?)\s*[:\uff1a]\s*(.+?)\s*$")
 
 # 单行内联标签定位正则：匹配「(行首或空白)标签:」，用于把一整行按标签切成多段。
 # 别名按长度降序，长别名优先（如 登录地址 先于 地址、mfa密钥 先于 mfa）。
@@ -1294,6 +1317,17 @@ def _parse_labeled_block_accounts(text: str) -> list[AccountInput]:
             flush()
         if field_name == "start_url":
             saw_start_url = True
+            # 一个块里可能同时给「默认 AWS access portal URL（仅限 IPv4）」和
+            # 「双栈 AWS access portal URL」两行——两者标签都含 portal/url，会都被
+            # 解析成 start_url。设备码登录必须用 IPv4 的 *.awsapps.com/start，
+            # 双栈 *.portal.<region>.app.aws 用不了。故：已有 awsapps 值时，
+            # 不让双栈 portal URL 覆盖；反之 awsapps 可覆盖已有的双栈值。
+            existing = cur.get("start_url", "")
+            if existing:
+                existing_awsapps = ".awsapps.com" in existing.lower()
+                new_awsapps = ".awsapps.com" in value.lower()
+                if existing_awsapps and not new_awsapps:
+                    continue
         cur[field_name] = value
     flush()
     return accounts if saw_start_url else []
@@ -1935,32 +1969,54 @@ def normalize_json_credential(item: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def load_json_credentials_from_zip(file_storage) -> list[dict[str, str]]:
+def _append_json_credentials(rows: list[dict[str, str]], data: Any, source_name: str) -> None:
+    """校验并追加一个 JSON 对象或数组中的 Kiro 凭据。"""
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        row = normalize_json_credential(item)
+        missing = [k for k in ("refresh_token", "client_id", "client_secret", "profile_arn") if not row.get(k)]
+        if missing:
+            raise ValueError(f"{source_name} 缺少字段：{', '.join(missing)}")
+        rows.append(row)
+
+
+def load_json_credentials_from_upload(file_storage) -> list[dict[str, str]]:
+    """从单个 JSON 文件或包含 JSON 的 ZIP 中读取 Kiro 凭据。"""
     raw = file_storage.read()
+    filename = (getattr(file_storage, "filename", "") or "").strip()
     if not raw:
-        raise ValueError("ZIP 文件为空")
+        raise ValueError("上传文件为空")
     if len(raw) > 10 * 1024 * 1024:
-        raise ValueError("ZIP 文件不能超过 10MB")
+        raise ValueError("上传文件不能超过 10MB")
     rows: list[dict[str, str]] = []
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        infos = [info for info in zf.infolist() if not info.is_dir() and info.filename.lower().endswith(".json")]
-        if len(infos) > MAX_ACCOUNTS_PER_JOB:
-            raise ValueError(f"单次最多处理 {MAX_ACCOUNTS_PER_JOB} 个 JSON")
-        for info in infos:
-            if info.file_size > 256 * 1024:
-                raise ValueError(f"JSON 文件过大：{info.filename}")
-            data = json.loads(zf.read(info).decode("utf-8"))
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                row = normalize_json_credential(item)
-                missing = [k for k in ("refresh_token", "client_id", "client_secret", "profile_arn") if not row.get(k)]
-                if missing:
-                    raise ValueError(f"{info.filename} 缺少字段：{', '.join(missing)}")
-                rows.append(row)
+
+    # 按 ZIP 魔数识别，避免只依赖可能不可靠的文件扩展名/MIME。
+    if raw.startswith(b"PK\x03\x04"):
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            infos = [info for info in zf.infolist() if not info.is_dir() and info.filename.lower().endswith(".json")]
+            if len(infos) > MAX_ACCOUNTS_PER_JOB:
+                raise ValueError(f"单次最多处理 {MAX_ACCOUNTS_PER_JOB} 个 JSON")
+            for info in infos:
+                if info.file_size > 256 * 1024:
+                    raise ValueError(f"JSON 文件过大：{info.filename}")
+                try:
+                    data = json.loads(zf.read(info).decode("utf-8-sig"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"JSON 格式不正确：{info.filename}（{exc}）") from exc
+                _append_json_credentials(rows, data, info.filename)
+    else:
+        if filename and not filename.lower().endswith(".json"):
+            raise ValueError("仅支持 .json 或 .zip 文件")
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"JSON 格式不正确：{exc}") from exc
+        _append_json_credentials(rows, data, filename or "上传的 JSON")
+
     if not rows:
-        raise ValueError("ZIP 内没有可用 JSON 凭据")
+        raise ValueError("文件内没有可用 JSON 凭据")
     if len(rows) > MAX_ACCOUNTS_PER_JOB:
         raise ValueError(f"单次最多处理 {MAX_ACCOUNTS_PER_JOB} 条凭据")
     return rows
@@ -2900,10 +2956,11 @@ def create_json_api_key_job():
     customer_id = current_customer_id()
     if not customer_id:
         return jsonify({"error": "请先输入客户密码"}), 401
-    if "zip" not in request.files:
-        return jsonify({"error": "请上传 ZIP 文件"}), 400
+    upload = request.files.get("file") or request.files.get("zip")
+    if not upload:
+        return jsonify({"error": "请上传 JSON 或 ZIP 文件"}), 400
     try:
-        rows = load_json_credentials_from_zip(request.files["zip"])
+        rows = load_json_credentials_from_upload(upload)
     except zipfile.BadZipFile:
         return jsonify({"error": "ZIP 文件格式不正确"}), 400
     except Exception as exc:

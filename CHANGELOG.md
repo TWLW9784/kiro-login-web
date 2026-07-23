@@ -2,6 +2,26 @@
 
 本项目所有值得记录的变更都写在这里。版本遵循语义化版本 `MAJOR.MINOR.PATCH`。
 
+## [1.0.8] - 2026-07-23
+
+### 新增
+
+- **直接上传 JSON 开通 API Key**：原有功能只接受包含 JSON 的 ZIP，现在也可直接上传单个 `.json` 凭据文件。
+  - 支持单个 JSON 对象或凭据数组。
+  - 继续兼容包含多个 JSON 文件的 ZIP。
+  - 支持 UTF-8 BOM，并按 ZIP 文件魔数识别内容，不依赖浏览器上报的 MIME。
+  - 对损坏 JSON、缺失凭据字段、空文件、超限文件返回明确错误。
+
+### 修复
+
+- **逗号账号导出格式**：支持 `start_url,region,username,password,CONTEXT_AWARE|`；一行同时含逗号和尾部竖线时不再误判为管道格式。
+- **AWS Portal URL 选择**：中文标签块同时含默认 IPv4 URL 与双栈 URL 时，优先使用可登录的 `*.awsapps.com/start`。
+- **标签解析增强**：标签名称可包含中英文括号和连字符。
+
+### 兼容性
+
+- JSON API Key 接口同时接受新的表单字段 `file` 与旧字段 `zip`，旧客户端无需修改。
+
 ## [1.0.7] - 2026-07-11
 
 ### 新增
@@ -57,3 +77,5 @@
 
 [1.0.6]: https://github.com/TWLW9784/kiro-login-web/releases/tag/v1.0.6
 [1.0.5]: https://github.com/TWLW9784/kiro-login-web/releases/tag/v1.0.5
+[1.0.8]: https://github.com/TWLW9784/kiro-login-web/releases/tag/v1.0.8
+[1.0.7]: https://github.com/TWLW9784/kiro-login-web/releases/tag/v1.0.7
